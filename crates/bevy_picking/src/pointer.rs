@@ -362,7 +362,17 @@ impl PointerInput {
                         }
                     });
                 }
-                _ => {}
+                PointerAction::Cancel => {
+                    pointers.iter_mut().for_each(|(id, mut pointer, mut press)| {
+                        if *id == event.pointer_id {
+                            pointer.location = None;
+                            press.primary = false;
+                            press.secondary = false;
+                            press.middle = false;
+                        }
+                    });
+                }
+                PointerAction::Scroll { .. } => {}
             }
         }
     }

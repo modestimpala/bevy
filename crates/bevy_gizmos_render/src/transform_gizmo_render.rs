@@ -7,7 +7,7 @@ use bevy_app::{App, Plugin, PostUpdate, Startup};
 use bevy_asset::{Assets, Handle};
 use bevy_camera::{
     visibility::{RenderLayers, Visibility},
-    Camera, Camera3d,
+    Camera, Camera3d, ClearColorConfig,
 };
 use bevy_color::Color;
 use bevy_ecs::{
@@ -359,6 +359,7 @@ fn spawn_gizmo_meshes(
         Camera3d::default(),
         Camera {
             order: 1,
+            clear_color: ClearColorConfig::None,
             ..Default::default()
         },
         GizmoOverlayCamera,

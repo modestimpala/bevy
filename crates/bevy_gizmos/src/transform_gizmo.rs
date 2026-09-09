@@ -22,6 +22,7 @@ use bevy_color::Color;
 use bevy_ecs::{
     component::Component,
     entity::Entity,
+    hierarchy::ChildOf,
     query::With,
     reflect::{ReflectComponent, ReflectResource},
     resource::Resource,
@@ -29,7 +30,7 @@ use bevy_ecs::{
     system::{Local, Query, Res, ResMut, Single},
 };
 use bevy_input::{mouse::MouseButton, ButtonInput};
-use bevy_math::{Quat, Vec2, Vec3};
+use bevy_math::{Mat3A, Quat, Vec2, Vec3};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_shape::Ray3d;
 use bevy_transform::components::{GlobalTransform, Transform};
@@ -406,9 +407,13 @@ fn transform_gizmo_hover(
 }
 
 fn transform_gizmo_drag(
-    mut focus_query: Query<(Entity, &GlobalTransform, &mut Transform), With<TransformGizmoFocus>>,
+    mut focus_query: Query<
+        (Entity, &GlobalTransform, &mut Transform, Option<&ChildOf>),
+        With<TransformGizmoFocus>,
+    >,
     marked_cameras: Query<(&Camera, &GlobalTransform), With<TransformGizmoCamera>>,
     all_cameras: Query<(&Camera, &GlobalTransform)>,
+    parent_transforms: Query<&GlobalTransform>,
     primary_window: Single<(&Window, &mut CursorOptions), With<PrimaryWindow>>,
     mouse: Res<ButtonInput<MouseButton>>,
     settings: Res<TransformGizmoSettings>,
@@ -426,7 +431,7 @@ fn transform_gizmo_drag(
     // Start drag
     if mouse.just_pressed(MouseButton::Left) && !state.active {
         if let Some(axis) = state.hovered_axis
-            && let Some((entity, global_tf, transform)) = focus_query.iter().next()
+            && let Some((entity, global_tf, transform, _)) = focus_query.iter().next()
         {
             let space = effective_space(&settings);
             let rotation = gizmo_rotation(global_tf, space);
@@ -494,8 +499,20 @@ fn transform_gizmo_drag(
         let Some(axis) = state.axis else {
             return;
         };
-        let Ok((_, global_tf, mut transform)) = focus_query.get_mut(drag_entity) else {
+        let Ok((_, global_tf, mut transform, child_of)) = focus_query.get_mut(drag_entity) else {
             return;
+        };
+        let parent_global = match child_of {
+            Some(child_of) => {
+                let Ok(parent_global) = parent_transforms.get(child_of.0) else {
+                    bevy_log::warn_once!(
+                        "Cannot transform gizmo focus relative to a parent without a GlobalTransform"
+                    );
+                    return;
+                };
+                Some(parent_global)
+            }
+            None => None,
         };
 
         let space = effective_space(&settings);
@@ -517,15 +534,20 @@ fn transform_gizmo_drag(
                         return;
                     };
                     let delta = intersection - state.drag_start_world;
-                    let new_pos = state.start_transform.translation + delta;
-                    transform.translation = match settings.snap_translate {
-                        Some(inc) => Vec3::new(
-                            snap_value(new_pos.x, inc),
-                            snap_value(new_pos.y, inc),
-                            snap_value(new_pos.z, inc),
-                        ),
-                        None => new_pos,
+                    let mut new_world_position = gizmo_origin + delta;
+                    if let Some(inc) = settings.snap_translate {
+                        new_world_position = Vec3::new(
+                            snap_value(new_world_position.x, inc),
+                            snap_value(new_world_position.y, inc),
+                            snap_value(new_world_position.z, inc),
+                        );
+                    }
+                    let Some(new_local_translation) =
+                        parent_local_translation(new_world_position, parent_global)
+                    else {
+                        return;
                     };
+                    transform.translation = new_local_translation;
                 } else {
                     let plane_normal = translation_plane_normal(ray, axis_dir);
                     let Some(intersection) = intersect_plane(ray, plane_normal, gizmo_origin)
@@ -537,13 +559,17 @@ fn transform_gizmo_drag(
                     let new_projected = cursor_vec.dot(axis_norm) * axis_norm + gizmo_origin;
                     let delta = new_projected - state.drag_start_world;
 
-                    transform.translation = match settings.snap_translate {
-                        Some(inc) => {
-                            state.start_transform.translation
-                                + axis_norm * snap_value(delta.dot(axis_norm), inc)
-                        }
-                        None => state.start_transform.translation + delta,
+                    let world_delta = match settings.snap_translate {
+                        Some(inc) => axis_norm * snap_value(delta.dot(axis_norm), inc),
+                        None => delta,
                     };
+                    let new_world_position = gizmo_origin + world_delta;
+                    let Some(new_local_translation) =
+                        parent_local_translation(new_world_position, parent_global)
+                    else {
+                        return;
+                    };
+                    transform.translation = new_local_translation;
                 }
             }
             TransformGizmoMode::Rotate => {
@@ -566,7 +592,13 @@ fn transform_gizmo_drag(
                     None => raw_angle,
                 };
                 let rotation_delta = Quat::from_axis_angle(rot_axis, angle);
-                transform.rotation = rotation_delta * state.start_transform.rotation;
+                let Some(local_rotation_delta) =
+                    parent_local_rotation_delta(rotation_delta, parent_global)
+                else {
+                    return;
+                };
+                transform.rotation =
+                    (local_rotation_delta * state.start_transform.rotation).normalize();
             }
             TransformGizmoMode::Scale => {
                 let (plane_normal, projection_dir) = if axis == TransformGizmoAxis::View {
@@ -656,6 +688,74 @@ fn transform_gizmo_drag(
             cursor_opts.grab_mode = *saved_grab_mode;
         }
     }
+}
+
+fn parent_local_translation(
+    world_translation: Vec3,
+    parent_global: Option<&GlobalTransform>,
+) -> Option<Vec3> {
+    let Some(parent_global) = parent_global else {
+        return Some(world_translation);
+    };
+    let parent_affine = parent_global.affine();
+    let determinant = parent_affine.matrix3.determinant();
+    if determinant == 0.0 || !determinant.is_finite() {
+        bevy_log::warn_once!(
+            "Cannot translate transform gizmo focus relative to a singular parent transform"
+        );
+        return None;
+    }
+    let local_translation = parent_affine.inverse().transform_point3(world_translation);
+    if !local_translation.is_finite() {
+        bevy_log::warn_once!(
+            "Cannot translate transform gizmo focus relative to a non-finite parent transform"
+        );
+        return None;
+    }
+    Some(local_translation)
+}
+
+fn parent_local_rotation_delta(
+    world_rotation_delta: Quat,
+    parent_global: Option<&GlobalTransform>,
+) -> Option<Quat> {
+    let Some(parent_global) = parent_global else {
+        return Some(world_rotation_delta);
+    };
+
+    // Conjugating the requested world rotation by the parent's full linear transform gives
+    // the exact local-space delta. It is representable by Transform::rotation only when that
+    // conjugated matrix remains a proper orthonormal rotation. This accepts compatible
+    // non-uniform scales, reflections, and shears while rejecting deltas that would require
+    // changing local scale or introducing shear.
+    let parent_linear = parent_global.affine().matrix3;
+    let parent_determinant = parent_linear.determinant();
+    if !parent_linear.is_finite() || !parent_determinant.is_finite() || parent_determinant == 0.0 {
+        bevy_log::warn_once!(
+            "Cannot rotate transform gizmo focus relative to a singular or non-finite parent transform"
+        );
+        return None;
+    }
+
+    let local_delta =
+        parent_linear.inverse() * Mat3A::from_quat(world_rotation_delta) * parent_linear;
+    let determinant = local_delta.determinant();
+    let is_proper_orthonormal = local_delta.is_finite()
+        && (local_delta.x_axis.length_squared() - 1.0).abs() <= 1e-4
+        && (local_delta.y_axis.length_squared() - 1.0).abs() <= 1e-4
+        && (local_delta.z_axis.length_squared() - 1.0).abs() <= 1e-4
+        && local_delta.x_axis.dot(local_delta.y_axis).abs() <= 1e-4
+        && local_delta.x_axis.dot(local_delta.z_axis).abs() <= 1e-4
+        && local_delta.y_axis.dot(local_delta.z_axis).abs() <= 1e-4
+        && (determinant - 1.0).abs() <= 1e-4;
+    if !is_proper_orthonormal {
+        bevy_log::warn_once!(
+            "Cannot rotate transform gizmo focus exactly: this world rotation through the parent transform would require local scale or shear"
+        );
+        return None;
+    }
+
+    Some(Quat::from_mat3a(&local_delta).normalize())
 }
 
 /// Get the world-space direction for a given axis.
@@ -773,4 +873,256 @@ pub fn gizmo_rotation(global_tf: &GlobalTransform, space: &TransformGizmoSpace) 
 
 fn snap_value(value: f32, increment: f32) -> f32 {
     (value / increment).round() * increment
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_camera::{
+        CameraProjection, ComputedCameraValues, OrthographicProjection, RenderTargetInfo, Viewport,
+    };
+    use bevy_math::UVec2;
+    use bevy_transform::TransformPlugin;
+    use bevy_window::WindowResolution;
+
+    fn drag_parented_entity(
+        mode: TransformGizmoMode,
+        axis: TransformGizmoAxis,
+        parent_transform: Transform,
+        child_transform: Transform,
+        drag_start_offset: Vec3,
+        drag_end_offset: Vec3,
+        snap_translate: Option<f32>,
+        snap_rotate: Option<f32>,
+    ) -> (GlobalTransform, GlobalTransform) {
+        let mut app = App::new();
+        app.add_plugins((TransformPlugin, TransformGizmoPlugin));
+
+        let parent_global = GlobalTransform::from(parent_transform);
+        let child_global = parent_global * child_transform;
+        let gizmo_origin = child_global.translation();
+        let camera_transform = Transform::from_translation(gizmo_origin + Vec3::new(6.0, 4.0, 8.0))
+            .looking_at(gizmo_origin, Vec3::Y);
+        let camera_global = GlobalTransform::from(camera_transform);
+        let viewport_size = UVec2::new(800, 600);
+        let viewport = Viewport {
+            physical_size: viewport_size,
+            ..Default::default()
+        };
+        let mut projection = OrthographicProjection::default_3d();
+        projection.update(viewport_size.x as f32, viewport_size.y as f32);
+        let camera = Camera {
+            viewport: Some(viewport),
+            computed: ComputedCameraValues {
+                clip_from_view: projection.get_clip_from_view(),
+                target_info: Some(RenderTargetInfo {
+                    physical_size: viewport_size,
+                    scale_factor: 1.0,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let drag_start = camera
+            .world_to_viewport(&camera_global, gizmo_origin + drag_start_offset)
+            .unwrap();
+        let drag_end = camera
+            .world_to_viewport(&camera_global, gizmo_origin + drag_end_offset)
+            .unwrap();
+
+        let mut window = Window {
+            resolution: WindowResolution::new(viewport_size.x, viewport_size.y),
+            ..Default::default()
+        };
+        window.set_cursor_position(Some(drag_start));
+        app.world_mut().spawn((window, PrimaryWindow));
+        app.world_mut().spawn((
+            camera,
+            camera_transform,
+            camera_global,
+            TransformGizmoCamera,
+        ));
+        let parent = app
+            .world_mut()
+            .spawn((parent_transform, parent_global))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((
+                child_transform,
+                child_global,
+                ChildOf(parent),
+                TransformGizmoFocus,
+            ))
+            .id();
+
+        let mut mouse = ButtonInput::<MouseButton>::default();
+        mouse.press(MouseButton::Left);
+        app.insert_resource(mouse);
+        {
+            let mut settings = app.world_mut().resource_mut::<TransformGizmoSettings>();
+            settings.mode = mode;
+            settings.space = TransformGizmoSpace::World;
+            settings.snap_translate = snap_translate;
+            settings.snap_rotate = snap_rotate;
+            settings.confine_cursor = false;
+        }
+        app.world_mut()
+            .resource_mut::<TransformGizmoState>()
+            .hovered_axis = Some(axis);
+
+        // The first frame starts the drag through transform_gizmo_drag.
+        app.update();
+        {
+            let world = app.world_mut();
+            let mut windows = world.query_filtered::<&mut Window, With<PrimaryWindow>>();
+            windows
+                .single_mut(world)
+                .unwrap()
+                .set_cursor_position(Some(drag_end));
+        }
+        // The second frame updates the local Transform and propagates its observable world pose.
+        app.update();
+
+        (
+            child_global,
+            *app.world().get::<GlobalTransform>(child).unwrap(),
+        )
+    }
+
+    #[test]
+    fn axis_translation_through_rotated_nonuniform_parent_moves_on_world_axis() {
+        let parent = Transform::from_xyz(3.0, -2.0, 1.0)
+            .with_rotation(Quat::from_rotation_z(core::f32::consts::FRAC_PI_2))
+            .with_scale(Vec3::new(2.0, 3.0, 0.5));
+        let child = Transform::from_xyz(1.0, 0.5, -2.0);
+
+        let (start, result) = drag_parented_entity(
+            TransformGizmoMode::Translate,
+            TransformGizmoAxis::X,
+            parent,
+            child,
+            Vec3::ZERO,
+            Vec3::new(0.76, 0.0, 0.0),
+            Some(0.5),
+            None,
+        );
+
+        assert!(
+            result
+                .translation()
+                .abs_diff_eq(start.translation() + Vec3::X, 1e-4),
+            "expected a snapped +world X move, got start={start:?}, result={result:?}"
+        );
+    }
+
+    #[test]
+    fn view_translation_through_rotated_nonuniform_parent_preserves_world_delta() {
+        let parent = Transform::from_xyz(-4.0, 3.0, 2.0)
+            .with_rotation(Quat::from_rotation_z(core::f32::consts::FRAC_PI_2))
+            .with_scale(Vec3::new(2.0, 3.0, 0.5));
+        let child = Transform::from_xyz(1.0, -0.5, 0.25);
+        let world_delta = Vec3::new(0.5, -0.75, 0.0);
+
+        let (start, result) = drag_parented_entity(
+            TransformGizmoMode::Translate,
+            TransformGizmoAxis::View,
+            parent,
+            child,
+            Vec3::ZERO,
+            world_delta,
+            None,
+            None,
+        );
+
+        assert!(
+            result
+                .translation()
+                .abs_diff_eq(start.translation() + world_delta, 1e-4),
+            "expected view-plane world delta, got start={start:?}, result={result:?}"
+        );
+    }
+
+    #[test]
+    fn rotation_through_rotated_uniform_parent_applies_world_rotation() {
+        let parent = Transform::from_xyz(3.0, -2.0, 1.0)
+            .with_rotation(Quat::from_rotation_z(core::f32::consts::FRAC_PI_2))
+            .with_scale(Vec3::splat(2.0));
+        let child = Transform::from_xyz(1.0, 0.5, -2.0).with_rotation(Quat::from_rotation_y(0.3));
+
+        let (start, result) = drag_parented_entity(
+            TransformGizmoMode::Rotate,
+            TransformGizmoAxis::X,
+            parent,
+            child,
+            Vec3::Y,
+            Vec3::Z,
+            None,
+            Some(core::f32::consts::FRAC_PI_2),
+        );
+
+        let (_, start_rotation, _) = start.to_scale_rotation_translation();
+        let (_, result_rotation, _) = result.to_scale_rotation_translation();
+        let expected_rotation =
+            Quat::from_rotation_x(core::f32::consts::FRAC_PI_2) * start_rotation;
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            assert!(
+                (result_rotation * axis).abs_diff_eq(expected_rotation * axis, 1e-4),
+                "expected world rotation on {axis:?}, got start={start:?}, result={result:?}"
+            );
+        }
+        assert!(result.translation().abs_diff_eq(start.translation(), 1e-4));
+    }
+
+    #[test]
+    fn compatible_rotation_through_nonuniform_parent_is_applied_exactly() {
+        let parent = Transform::from_xyz(3.0, -2.0, 1.0)
+            .with_rotation(Quat::from_rotation_z(core::f32::consts::FRAC_PI_2))
+            // World X maps to parent-local -Y; equal X/Z scales make rotation about Y exact.
+            .with_scale(Vec3::new(3.0, 2.0, 3.0));
+        let child = Transform::from_xyz(1.0, 0.5, -2.0).with_rotation(Quat::from_rotation_y(0.3));
+
+        let (start, result) = drag_parented_entity(
+            TransformGizmoMode::Rotate,
+            TransformGizmoAxis::X,
+            parent,
+            child,
+            Vec3::Y,
+            Vec3::Z,
+            None,
+            Some(core::f32::consts::FRAC_PI_2),
+        );
+
+        let expected_linear = Mat3A::from_quat(Quat::from_rotation_x(core::f32::consts::FRAC_PI_2))
+            * start.affine().matrix3;
+        assert!(
+            result.affine().matrix3.abs_diff_eq(expected_linear, 1e-4),
+            "representable non-uniform-parent rotation must be applied exactly"
+        );
+        assert!(result.translation().abs_diff_eq(start.translation(), 1e-4));
+    }
+
+    #[test]
+    fn rotation_through_nonuniform_parent_is_rejected_without_approximation() {
+        let parent = Transform::from_xyz(3.0, -2.0, 1.0)
+            .with_rotation(Quat::from_rotation_z(core::f32::consts::FRAC_PI_2))
+            .with_scale(Vec3::new(2.0, 3.0, 1.0));
+        let child = Transform::from_xyz(1.0, 0.5, -2.0).with_rotation(Quat::from_rotation_y(0.3));
+
+        let (start, result) = drag_parented_entity(
+            TransformGizmoMode::Rotate,
+            TransformGizmoAxis::X,
+            parent,
+            child,
+            Vec3::Y,
+            Vec3::Z,
+            None,
+            Some(core::f32::consts::FRAC_PI_2),
+        );
+
+        assert!(
+            result.affine().abs_diff_eq(start.affine(), 1e-4),
+            "non-representable rotation must leave the world pose unchanged"
+        );
+    }
 }

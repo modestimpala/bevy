@@ -119,7 +119,7 @@ macro_rules! impl_atomic_pod {
     (
         $pod_ty: ty,
         $blob_ty: ident
-        $(, field($field_name: ident : $field_ty: ty, $getter: ident $(, $($setter: ident)?)?))*
+        $(, field($field_name: ident : $field_ty: ty, $getter: ident $(, $setter: ident)? $(,)?))*
         $(,)?
     ) => {
         #[derive(::bevy_derive::Deref, ::bevy_derive::DerefMut)]
@@ -179,7 +179,6 @@ macro_rules! impl_atomic_pod {
 
         impl $blob_ty {
             $(
-                $(
                     pub fn $getter(&self) -> $field_ty {
                         const _ASSERT_FIELD_SIZE: () = ::core::assert!(
                             ::core::mem::size_of::<$field_ty>() % 4 == 0
@@ -209,8 +208,7 @@ macro_rules! impl_atomic_pod {
                             }
                         }
                     )?
-                )*
-            )?
+            )*
         }
     };
 }

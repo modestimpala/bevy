@@ -38,6 +38,7 @@ pub mod retained;
 pub mod rounded_box;
 mod simplex_stroke_font;
 pub mod stroke_text;
+pub use simplex_stroke_font::SIMPLEX_STROKE_FONT;
 pub mod transform_gizmo;
 
 #[cfg(feature = "bevy_mesh")]

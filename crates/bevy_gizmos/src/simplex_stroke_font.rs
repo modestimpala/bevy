@@ -1405,6 +1405,7 @@ pub(crate) const SIMPLEX_GLYPHS: [(i8, Range<usize>); 95] = [
     (24, 186..188),
 ];
 
+/// The font used by gizmo text; its layout measures the same bounds used when drawing.
 pub const SIMPLEX_STROKE_FONT: StrokeFont = StrokeFont {
     line_height: LINE_HEIGHT,
     advance: 16,

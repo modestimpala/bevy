@@ -4,11 +4,23 @@
 // http://leiy.cc/publications/TAA/TAA_EG2020_Talk.pdf
 // https://advances.realtimerendering.com/s2014/index.html#_HIGH-QUALITY_TEMPORAL_SUPERSAMPLING
 
+import bevy_render::view::View;
+
+// Matches bevy_core_pipeline::prepass::PreviousViewData.
+struct PreviousView {
+    view_from_world: mat4x4<f32>,
+    clip_from_world: mat4x4<f32>,
+    unjittered_clip_from_world: mat4x4<f32>,
+    clip_from_view: mat4x4<f32>,
+    world_from_clip: mat4x4<f32>,
+    view_from_clip: mat4x4<f32>,
+}
+
 /// Controls how much to blend between the current and past samples
 /// Lower numbers = less of the current sample and more of the past sample = more smoothing
 /// Values chosen empirically
-const DEFAULT_HISTORY_BLEND_RATE: f32 = 0.1; // Default blend rate to use when no confidence in history
-const MIN_HISTORY_BLEND_RATE: f32 = 0.015; // Minimum blend rate allowed, to ensure at least some of the current sample is used
+const MOVING_HISTORY_BLEND_RATE: f32 = 0.3;
+const STILL_HISTORY_BLEND_RATE: f32 = 0.05;
 
 @group(0) @binding(0) var view_target: texture_2d<f32>;
 @group(0) @binding(1) var history: texture_2d<f32>;
@@ -16,6 +28,8 @@ const MIN_HISTORY_BLEND_RATE: f32 = 0.015; // Minimum blend rate allowed, to ens
 @group(0) @binding(3) var depth: texture_depth_2d;
 @group(0) @binding(4) var nearest_sampler: sampler;
 @group(0) @binding(5) var linear_sampler: sampler;
+@group(0) @binding(6) var<uniform> view: View;
+@group(0) @binding(7) var<uniform> previous_view: PreviousView;
 
 struct Output {
     @location(0) view_target: vec4<f32>,
@@ -80,11 +94,11 @@ fn taa(@location(0) uv: vec2<f32>) -> Output {
 
     // Fetch the current sample
     let original_color = textureSample(view_target, nearest_sampler, uv);
+    let current_depth = textureSample(depth, nearest_sampler, uv);
     var current_color = original_color.rgb;
 @if(TONEMAP)
     current_color = tonemap(current_color);
 
-    var history_confidence: f32;
 @if(!RESET) {
     // Pick the closest motion_vector from 5 samples (reduces aliasing on the edges of moving entities)
     // https://advances.realtimerendering.com/s2014/index.html#_HIGH-QUALITY_TEMPORAL_SUPERSAMPLING, slide 27
@@ -96,7 +110,7 @@ fn taa(@location(0) uv: vec2<f32>) -> Output {
     var closest_uv = uv;
     let d_tl = textureSample(depth, nearest_sampler, d_uv_tl);
     let d_tr = textureSample(depth, nearest_sampler, d_uv_tr);
-    var closest_depth = textureSample(depth, nearest_sampler, uv);
+    var closest_depth = current_depth;
     let d_bl = textureSample(depth, nearest_sampler, d_uv_bl);
     let d_br = textureSample(depth, nearest_sampler, d_uv_br);
     if d_tl > closest_depth {
@@ -160,26 +174,26 @@ fn taa(@location(0) uv: vec2<f32>) -> Output {
     history_color = clip_towards_aabb_center(history_color, s_mm, mean - std_deviation, mean + std_deviation);
     history_color = YCoCg_to_RGB(history_color);
 
-    // How confident we are that the history is representative of the current frame
-    history_confidence = textureSample(history, nearest_sampler, uv).a;
-    let pixel_motion_vector = abs(closest_motion_vector) * texture_size;
-    if pixel_motion_vector.x < 0.01 && pixel_motion_vector.y < 0.01 {
-        // Increment when pixels are not moving
-        history_confidence += 10.0;
-    } else {
-        // Else reset
-        history_confidence = 1.0;
-    }
+    // Depth belongs to this pixel, not the foreground donor of its dilated motion
+    // vector. Reproject through the previous camera so camera motion alone does
+    // not look like disocclusion. Object motion in depth may conservatively reject.
+    let current_clip = vec4(uv * vec2(2.0, -2.0) + vec2(-1.0, 1.0), current_depth, 1.0);
+    let previous_clip = previous_view.clip_from_world * (view.world_from_clip * current_clip);
+    let expected_depth = previous_clip.z / previous_clip.w;
+    let history_depth = textureSample(history, nearest_sampler, history_uv).a;
+    // Allow depth quantization and subpixel sampling on slopes, but cap the slope
+    // allowance so a silhouette discontinuity cannot validate unrelated history.
+    let depth_tolerance = max(abs(expected_depth) * 0.01
+        + min(fwidth(expected_depth), abs(expected_depth) * 0.01), 0.000001);
+    let sky_changed = (current_depth == 0.0) != (history_depth == 0.0);
+    let surface_changed = current_depth != 0.0
+        && (previous_clip.w <= 0.0 || abs(history_depth - expected_depth) > depth_tolerance);
 
-    // Blend current and past sample
-    // Use more of the history if we're confident in it (reduces noise when there is no motion)
-    // https://hhoppe.com/supersample.pdf, section 4.1
-    var current_color_factor = clamp(1.0 / history_confidence, MIN_HISTORY_BLEND_RATE, DEFAULT_HISTORY_BLEND_RATE);
-
-    // Reject history when motion vectors point off screen
-    if any(saturate(history_uv) != history_uv) {
+    let pixel_motion = length(closest_motion_vector * texture_size);
+    var current_color_factor = mix(STILL_HISTORY_BLEND_RATE, MOVING_HISTORY_BLEND_RATE,
+        smoothstep(0.0, 1.0, pixel_motion));
+    if sky_changed || surface_changed || any(saturate(history_uv) != history_uv) {
         current_color_factor = 1.0;
-        history_confidence = 1.0;
     }
 
     current_color = mix(history_color, current_color, current_color_factor);
@@ -188,9 +202,7 @@ fn taa(@location(0) uv: vec2<f32>) -> Output {
 
     // Write output to history and view target
     var out: Output;
-@if(RESET)
-    history_confidence = 1.0 / MIN_HISTORY_BLEND_RATE;
-    out.history = vec4(current_color, history_confidence);
+    out.history = vec4(current_color, current_depth);
 @if(TONEMAP)
     current_color = reverse_tonemap(current_color);
     out.view_target = vec4(current_color, original_color.a);

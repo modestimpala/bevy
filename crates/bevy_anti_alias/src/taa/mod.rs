@@ -2,7 +2,10 @@ use bevy_app::{App, Plugin};
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer};
 use bevy_camera::{Camera, Camera3d};
 use bevy_core_pipeline::{
-    prepass::{DepthPrepass, MotionVectorPrepass, ViewPrepassTextures},
+    prepass::{
+        DepthPrepass, MotionVectorPrepass, PreviousViewData, PreviousViewUniformOffset,
+        PreviousViewUniforms, ViewPrepassTextures,
+    },
     schedule::{Core3d, Core3dSystems},
     FullscreenShader,
 };
@@ -22,7 +25,7 @@ use bevy_render::{
     camera::{ExtractedCamera, MipBias, TemporalJitter},
     diagnostic::RecordDiagnostics,
     render_resource::{
-        binding_types::{sampler, texture_2d, texture_depth_2d},
+        binding_types::{sampler, texture_2d, texture_depth_2d, uniform_buffer},
         BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
         CachedRenderPipelineId, Canonical, ColorTargetState, ColorWrites, FilterMode,
         FragmentState, Operations, PipelineCache, RenderPassColorAttachment, RenderPassDescriptor,
@@ -34,7 +37,7 @@ use bevy_render::{
     sync_component::{SyncComponent, SyncComponentPlugin},
     sync_world::RenderEntity,
     texture::{CachedTexture, TextureCache},
-    view::{ExtractedView, Msaa, ViewTarget},
+    view::{ExtractedView, Msaa, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
     ExtractSchedule, MainWorld, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_utils::default;
@@ -93,6 +96,9 @@ impl Plugin for TemporalAntiAliasPlugin {
 ///
 /// Because TAA blends past frames with the current frame, when the frames differ too much
 /// (such as with fast moving objects or camera cuts), ghosting artifacts may occur.
+/// Valid history is blended with 5% current color at rest, rising to 30% with pixel motion.
+/// Depth-inconsistent history is rejected per pixel, rather than resetting the whole view.
+/// Depth is kept in a floating-point history alpha channel, also for non-HDR cameras.
 ///
 /// Artifacts tend to be reduced at higher framerates and rendering resolution.
 ///
@@ -141,13 +147,25 @@ pub fn temporal_anti_alias(
         &ViewPrepassTextures,
         &TemporalAntiAliasPipelineId,
         &Msaa,
+        &ViewUniformOffset,
+        &PreviousViewUniformOffset,
     )>,
     pipelines: Option<Res<TaaPipeline>>,
     pipeline_cache: Res<PipelineCache>,
+    view_uniforms: Res<ViewUniforms>,
+    previous_view_uniforms: Res<PreviousViewUniforms>,
     mut ctx: RenderContext,
 ) {
-    let (camera, view_target, taa_history_textures, prepass_textures, taa_pipeline_id, msaa) =
-        view.into_inner();
+    let (
+        camera,
+        view_target,
+        taa_history_textures,
+        prepass_textures,
+        taa_pipeline_id,
+        msaa,
+        view_uniform_offset,
+        previous_view_uniform_offset,
+    ) = view.into_inner();
 
     if *msaa != Msaa::Off {
         warn!("Temporal anti-aliasing requires MSAA to be disabled");
@@ -164,6 +182,12 @@ pub fn temporal_anti_alias(
     ) else {
         return;
     };
+    let (Some(view_binding), Some(previous_view_binding)) = (
+        view_uniforms.uniforms.binding(),
+        previous_view_uniforms.uniforms.binding(),
+    ) else {
+        return;
+    };
 
     let view_target = view_target.post_process_write();
 
@@ -177,6 +201,8 @@ pub fn temporal_anti_alias(
             &prepass_depth_texture.texture.default_view,
             &pipelines.nearest_sampler,
             &pipelines.linear_sampler,
+            view_binding,
+            previous_view_binding,
         )),
     );
 
@@ -207,7 +233,14 @@ pub fn temporal_anti_alias(
     let pass_span = diagnostics.pass_span(&mut taa_pass, "taa");
 
     taa_pass.set_render_pipeline(taa_pipeline);
-    taa_pass.set_bind_group(0, &taa_bind_group, &[]);
+    taa_pass.set_bind_group(
+        0,
+        &taa_bind_group,
+        &[
+            view_uniform_offset.offset,
+            previous_view_uniform_offset.offset,
+        ],
+    );
     if let Some(viewport) = camera.viewport.as_ref() {
         taa_pass.set_camera_viewport(viewport);
     }
@@ -260,6 +293,9 @@ fn init_taa_pipeline(
                 sampler(SamplerBindingType::NonFiltering),
                 // Linear sampler
                 sampler(SamplerBindingType::Filtering),
+                // Current and previous camera transforms for depth rejection.
+                uniform_buffer::<ViewUniform>(true),
+                uniform_buffer::<PreviousViewData>(true),
             ),
         ),
     );
@@ -320,8 +356,16 @@ impl Specializer<RenderPipeline> for TaaPipelineSpecializer {
             write_mask: ColorWrites::ALL,
         };
 
-        fragment.set_target(0, color_target_state.clone());
-        fragment.set_target(1, color_target_state);
+        fragment.set_target(0, color_target_state);
+        // Alpha stores reverse-Z depth, including on non-HDR cameras.
+        fragment.set_target(
+            1,
+            ColorTargetState {
+                format: TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            },
+        );
 
         Ok(key)
     }
@@ -393,9 +437,9 @@ fn prepare_taa_history_textures(
     mut texture_cache: ResMut<TextureCache>,
     render_device: Res<RenderDevice>,
     frame_count: Res<FrameCount>,
-    cameras: Query<(Entity, &ExtractedView, &ExtractedCamera), With<TemporalAntiAliasing>>,
+    cameras: Query<(Entity, &ExtractedCamera), With<TemporalAntiAliasing>>,
 ) {
-    for (entity, view, camera) in &cameras {
+    for (entity, camera) in &cameras {
         if let Some(physical_target_size) = camera.physical_target_size {
             let mut texture_descriptor = TextureDescriptor {
                 label: None,
@@ -403,7 +447,7 @@ fn prepare_taa_history_textures(
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: TextureDimension::D2,
-                format: view.target_format,
+                format: TextureFormat::Rgba16Float,
                 usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT,
                 view_formats: &[],
             };

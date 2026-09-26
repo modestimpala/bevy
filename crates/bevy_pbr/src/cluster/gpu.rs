@@ -1603,12 +1603,14 @@ pub fn extract_clusters_for_gpu_clustering(
 /// views.
 pub(crate) fn prepare_clusters_for_gpu_clustering(
     mut commands: Commands,
-    views_query: Query<(
+    mut views_query: Query<(
         Entity,
         &MainEntity,
         &ExtractedClusterConfig,
         Option<&RenderViewLightProbes<EnvironmentMapLight>>,
         Option<&RenderViewLightProbes<IrradianceVolume>>,
+        Option<&mut ViewClusterBindings>,
+        Option<&mut ViewGpuClusteringBuffers>,
     )>,
     render_clustered_decals: Res<RenderClusteredDecals>,
     render_device: Res<RenderDevice>,
@@ -1634,11 +1636,21 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
         extracted_cluster_config,
         maybe_environment_maps,
         maybe_irradiance_volumes,
-    ) in &views_query
+        maybe_view_clusters_bindings,
+        maybe_view_gpu_clustering_buffers,
+    ) in &mut views_query
     {
-        // Allocate the cluster array.
-        let mut view_clusters_bindings =
-            ViewClusterBindings::new(BufferBindingType::Storage { read_only: false });
+        // Allocate the cluster array, in the view's buffers from last frame where it has
+        // them. Buffers created afresh every frame are created mapped and filled from the
+        // CPU, which some drivers make very slow once much of the GPU's memory is in use;
+        // reused, they are written in place.
+        let storage = BufferBindingType::Storage { read_only: false };
+        let mut view_clusters_bindings = match maybe_view_clusters_bindings {
+            Some(mut bindings) => {
+                core::mem::replace(&mut *bindings, ViewClusterBindings::new(storage))
+            }
+            None => ViewClusterBindings::new(storage),
+        };
         view_clusters_bindings.clear();
         let cluster_count = extracted_cluster_config.dimensions.x as usize
             * extracted_cluster_config.dimensions.y as usize
@@ -1662,7 +1674,13 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
             continue;
         };
 
-        let mut view_gpu_clustering_buffers = ViewGpuClusteringBuffers::new();
+        let mut view_gpu_clustering_buffers = match maybe_view_gpu_clustering_buffers {
+            Some(mut buffers) => core::mem::replace(&mut *buffers, ViewGpuClusteringBuffers::new()),
+            None => ViewGpuClusteringBuffers::new(),
+        };
+        view_gpu_clustering_buffers
+            .scratchpad_offsets_and_counts_buffer
+            .clear();
 
         // Count the number of each type of clusterable object that we have.
         let clustered_light_count = gpu_clustered_lights_storage.data.len() as u32;

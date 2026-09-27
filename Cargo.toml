@@ -1600,6 +1600,18 @@ wasm = false
 hidden = true
 
 [[example]]
+name = "solari_skinned"
+path = "examples/3d/solari_skinned.rs"
+doc-scrape-examples = true
+required-features = ["bevy_solari"]
+
+[package.metadata.example.solari_skinned]
+name = "Solari Skinned"
+description = "A skinned, animated mesh lit and shadowed by Solari's raytracing"
+category = "3D Rendering"
+wasm = false
+
+[[example]]
 name = "spherical_area_lights"
 path = "examples/3d/spherical_area_lights.rs"
 doc-scrape-examples = true

@@ -72,6 +72,11 @@ impl BlasManager {
         }
     }
 
+    /// Deletes an acceleration structure once no TLAS still in use can point at it.
+    pub(super) fn retire_blas(&mut self, blas: Blas) {
+        self.retire(blas);
+    }
+
     fn retire(&mut self, blas: Blas) {
         match self.pending_deletions.back_mut() {
             Some(batch) => batch.push(blas),

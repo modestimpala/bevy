@@ -1,17 +1,20 @@
 mod binder;
 mod blas;
 mod extract;
+mod skinning;
 mod types;
 
 use bevy_asset::embedded_asset;
 use bevy_shader::load_shader_library;
 pub use binder::prepare_raytracing_scene_resources;
 pub use binder::{RaytracingSceneBindings, RaytracingSceneNeedsPreviousFrameData};
+pub use skinning::RaytracingSkins;
 pub use types::RaytracingMesh3d;
 
 use crate::SolariPlugins;
 use bevy_app::{App, Plugin};
 use bevy_ecs::schedule::IntoScheduleConfigs;
+use bevy_pbr::prepare_skins;
 use bevy_render::{
     mesh::{
         allocator::{allocate_and_free_meshes, MeshAllocatorSettings},
@@ -31,6 +34,7 @@ use extract::{
     extract_raytracing_scene_meshes_and_materials, extract_raytracing_scene_structural,
     extract_raytracing_scene_transforms, ExtractedEnvironmentMapLight, StandardMaterialAssets,
 };
+use skinning::{extract_raytracing_skins, prepare_raytracing_skins};
 use tracing::warn;
 
 /// Creates acceleration structures and binding arrays of resources for raytracing.
@@ -42,6 +46,7 @@ impl Plugin for RaytracingScenePlugin {
         load_shader_library!(app, "bindings.wesl");
         load_shader_library!(app, "sampling.wesl");
         embedded_asset!(app, "binder/setup_tlas_instances.wesl");
+        embedded_asset!(app, "skinning.wesl");
     }
 
     fn finish(&self, app: &mut App) {
@@ -68,6 +73,7 @@ impl Plugin for RaytracingScenePlugin {
             .init_gpu_resource::<StandardMaterialAssets>()
             .init_gpu_resource::<RaytracingSceneBindings>()
             .init_gpu_resource::<TlasInstanceSetupPipeline>()
+            .init_gpu_resource::<RaytracingSkins>()
             .add_systems(
                 ExtractSchedule,
                 (
@@ -76,6 +82,7 @@ impl Plugin for RaytracingScenePlugin {
                     extract_raytracing_scene_meshes_and_materials,
                     extract_raytracing_material_assets,
                     extract_raytracing_environment_map_light,
+                    extract_raytracing_skins,
                 ),
             )
             .add_systems(
@@ -88,6 +95,10 @@ impl Plugin for RaytracingScenePlugin {
                     compact_raytracing_blas
                         .in_set(RenderSystems::PrepareAssets)
                         .after(prepare_raytracing_blas),
+                    prepare_raytracing_skins
+                        .in_set(RenderSystems::PrepareResources)
+                        .after(prepare_skins)
+                        .before(prepare_raytracing_scene_resources),
                     prepare_raytracing_scene_resources.in_set(RenderSystems::PrepareResources),
                     prepare_raytracing_scene_bind_group.in_set(RenderSystems::PrepareBindGroups),
                 ),

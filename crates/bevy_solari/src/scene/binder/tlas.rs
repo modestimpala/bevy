@@ -1,6 +1,6 @@
 use super::{
     bind_group::BindGroupCacheState, instances::InstanceState, tlas_build, BlasManager,
-    RaytracingSceneBindings,
+    RaytracingSceneBindings, RaytracingSkins,
 };
 use bevy_asset::load_embedded_asset;
 use bevy_ecs::{
@@ -332,6 +332,7 @@ impl TlasState {
 pub fn build_raytracing_tlas(
     mut bindings: ResMut<RaytracingSceneBindings>,
     mut blas_manager: ResMut<BlasManager>,
+    skins: Res<RaytracingSkins>,
     pipeline_cache: Res<PipelineCache>,
     pipeline: Res<TlasInstanceSetupPipeline>,
     mut render_context: RenderContext,
@@ -344,7 +345,7 @@ pub fn build_raytracing_tlas(
             setup_tlas_instances(bindings, &pipeline_cache, &pipeline, &mut render_context)
                 && build_tlas_raw(bindings, backend, &mut render_context)
         }
-        None => build_tlas_through_wgpu_core(bindings, &blas_manager, &mut render_context),
+        None => build_tlas_through_wgpu_core(bindings, &blas_manager, &skins, &mut render_context),
     };
 
     if built {
@@ -480,6 +481,7 @@ fn build_tlas_raw(
 fn build_tlas_through_wgpu_core(
     bindings: &mut RaytracingSceneBindings,
     blas_manager: &BlasManager,
+    skins: &RaytracingSkins,
     render_context: &mut RenderContext,
 ) -> bool {
     // An empty scene leaves the index unswapped, so whatever is here belongs to an earlier frame
@@ -500,10 +502,15 @@ fn build_tlas_through_wgpu_core(
         let capacity = tlas.get().len();
         tlas[0..capacity].iter_mut().for_each(|entry| *entry = None);
 
-        for (slot, mesh, transform) in bindings.instances.drawable() {
+        for (slot, entity, mesh, transform) in bindings.instances.drawable() {
             // A mesh can lose its acceleration structure after the instance resolved against it,
             // which leaves the slot with nothing to point at for a frame
-            let Some(blas) = blas_manager.get(&mesh) else {
+            let blas = if skins.contains(entity) {
+                skins.blas(entity)
+            } else {
+                blas_manager.get(&mesh)
+            };
+            let Some(blas) = blas else {
                 continue;
             };
             tlas[slot as usize] = Some(TlasInstance::new(blas, transform, slot, 0xFF));

@@ -15,7 +15,9 @@ use self::instances::{
 use self::lights::LightState;
 use self::tlas::TlasState;
 pub use self::tlas::{build_raytracing_tlas, TlasInstanceSetupPipeline};
-use super::{blas::BlasManager, extract::StandardMaterialAssets, RaytracingMesh3d};
+use super::{
+    blas::BlasManager, extract::StandardMaterialAssets, skinning::RaytracingSkins, RaytracingMesh3d,
+};
 use bevy_ecs::{
     entity::Entity,
     lifecycle::RemovedComponents,
@@ -55,6 +57,11 @@ pub struct RaytracingSceneBindings {
 }
 
 impl RaytracingSceneBindings {
+    /// Resolves an instance again during the next scene preparation.
+    pub(crate) fn refresh_instance_later(&mut self, entity: Entity) {
+        self.instances.pending_refresh.insert(entity);
+    }
+
     /// Records that a lighting pass read `previous_frame_light_id_translations`, so the next
     /// frame's table translates from this frame's light ids rather than older ones.
     pub fn note_light_translations_consumed(&self) {
@@ -132,6 +139,7 @@ pub fn prepare_raytracing_scene_resources(
     needs_previous_frame_data: Option<Res<RaytracingSceneNeedsPreviousFrameData>>,
     mesh_allocator: Res<MeshAllocator>,
     blas_manager: Res<BlasManager>,
+    skins: Res<RaytracingSkins>,
     material_assets: Res<StandardMaterialAssets>,
     texture_assets: Res<RenderAssets<GpuImage>>,
     extracted_images: Res<ExtractedAssets<GpuImage>>,
@@ -166,6 +174,7 @@ pub fn prepare_raytracing_scene_resources(
         assets: &bindings.assets,
         blas_manager: &blas_manager,
         mesh_allocator: &mesh_allocator,
+        skins: &skins,
     };
     bindings.instances.refresh_instances(
         &inputs,
@@ -173,6 +182,7 @@ pub fn prepare_raytracing_scene_resources(
         &instances,
         &changed_instances,
     );
+    bindings.instances.repoint_skins(&skins);
 
     // Update the light set, now that emissive instances are resolved
     bindings.lights.update(&directional_lights);

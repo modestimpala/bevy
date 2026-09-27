@@ -2,7 +2,7 @@ use super::{
     allocator::{IndexAllocator, RetainedBindingArray},
     assets::AssetState,
     lights::{GpuLightSource, LightSourceId, LightState},
-    BlasManager, RaytracingMesh3d, RaytracingSceneBindings,
+    BlasManager, RaytracingMesh3d, RaytracingSceneBindings, RaytracingSkins,
 };
 use bevy_asset::AssetId;
 use bevy_ecs::{
@@ -113,17 +113,36 @@ impl InstanceState {
         }
     }
 
-    /// Every drawable instance's slot, mesh and world-from-local transform.
+    /// Every drawable instance's slot, entity, mesh and world-from-local transform.
     ///
     /// Only the `wgpu-core` TLAS build path needs this, to fill in the instance descriptors that
     /// the raw path sets up on the GPU. Slots with a null acceleration structure reference are not
     /// currently drawable, and are left out.
-    pub fn drawable(&self) -> impl Iterator<Item = (u32, AssetId<Mesh>, [f32; 12])> + '_ {
-        self.records.values().filter_map(|instance| {
+    pub fn drawable(&self) -> impl Iterator<Item = (u32, Entity, AssetId<Mesh>, [f32; 12])> + '_ {
+        self.records.iter().filter_map(|(&entity, instance)| {
             let slot = instance.slot;
-            (self.blas_refs.get(slot) != GpuBlasRef::NONE)
-                .then(|| (slot, instance.mesh, self.transforms.get(slot).rows()))
+            (self.blas_refs.get(slot) != GpuBlasRef::NONE).then(|| {
+                (
+                    slot,
+                    entity,
+                    instance.mesh,
+                    self.transforms.get(slot).rows(),
+                )
+            })
         })
+    }
+
+    /// Points each skinned instance whose acceleration structure was rebuilt this frame at the
+    /// new one. An instance not yet resolved picks it up when it is.
+    pub fn repoint_skins(&mut self, skins: &RaytracingSkins) {
+        for (entity, address) in skins.moved() {
+            let Some(slot) = self.records.get(&entity).map(|instance| instance.slot) else {
+                continue;
+            };
+            if self.blas_refs.get(slot) != GpuBlasRef::NONE {
+                self.set_blas_ref(slot, GpuBlasRef(address));
+            }
+        }
     }
 
     /// Queues every instance using `material_id` to be re-resolved.
@@ -154,6 +173,7 @@ pub struct InstanceInputs<'a> {
     pub assets: &'a AssetState,
     pub blas_manager: &'a BlasManager,
     pub mesh_allocator: &'a MeshAllocator,
+    pub skins: &'a RaytracingSkins,
 }
 
 fn unlink<K: Eq + Hash>(map: &mut HashMap<K, EntityHashSet>, key: &K, entity: Entity) {
@@ -290,17 +310,35 @@ impl InstanceState {
         instance: &mut Instance,
     ) -> bool {
         let slot = instance.slot;
-        let (Some(vertex_slice), Some(index_slice), Some(material_slot), Some(blas_address)) = (
-            inputs.mesh_allocator.mesh_vertex_slice(&instance.mesh),
+        // A skinned instance is traced from its own skinned vertices and structure, once it has
+        // been skinned; anything else from its mesh's
+        let geometry = if inputs.skins.contains(entity) {
+            inputs
+                .skins
+                .geometry(entity)
+                .map(|(buffer, address)| (buffer, 0, address))
+        } else {
+            inputs
+                .mesh_allocator
+                .mesh_vertex_slice(&instance.mesh)
+                .zip(inputs.blas_manager.device_address(&instance.mesh))
+                .map(|(slice, address)| (slice.buffer, slice.range.start, address))
+        };
+        let (
+            Some((vertex_buffer, vertex_buffer_offset, blas_address)),
+            Some(index_slice),
+            Some(material_slot),
+        ) = (
+            geometry,
             inputs.mesh_allocator.mesh_index_slice(&instance.mesh),
             inputs.assets.material_slots.get(&instance.material),
-            inputs.blas_manager.device_address(&instance.mesh),
-        ) else {
+        )
+        else {
             self.deactivate_instance(lights, entity, instance);
             return false;
         };
 
-        let vertex_buffer_key = vertex_slice.buffer.id();
+        let vertex_buffer_key = vertex_buffer.id();
         let index_buffer_key = index_slice.buffer.id();
         let capacity = MAX_MESH_SLAB_COUNT.get();
         if !self.vertex_buffers.has_room(&vertex_buffer_key, capacity)
@@ -318,7 +356,7 @@ impl InstanceState {
         let previous_buffers = instance.buffers.take();
         let vertex_buffer_id = self
             .vertex_buffers
-            .acquire(vertex_buffer_key, capacity, || vertex_slice.buffer.clone())
+            .acquire(vertex_buffer_key, capacity, || vertex_buffer.clone())
             .expect("vertex slab binding array had room but handed out no slot");
         let index_buffer_id = self
             .index_buffers
@@ -332,7 +370,7 @@ impl InstanceState {
             slot,
             GpuInstanceGeometryIds {
                 vertex_buffer_id,
-                vertex_buffer_offset: vertex_slice.range.start,
+                vertex_buffer_offset,
                 index_buffer_id,
                 index_buffer_offset: index_slice.range.start,
                 triangle_count,

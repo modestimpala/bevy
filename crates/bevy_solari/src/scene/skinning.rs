@@ -39,7 +39,7 @@ use bevy_render::{
         },
         *,
     },
-    renderer::{RenderDevice, RenderQueue},
+    renderer::{PendingCommandBuffers, RenderDevice, RenderQueue},
     sync_world::{MainEntity, RenderEntity},
     Extract,
 };
@@ -318,6 +318,7 @@ pub fn prepare_raytracing_skins(
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    mut pending_command_buffers: ResMut<PendingCommandBuffers>,
     mut skins: ResMut<RaytracingSkins>,
     mut blas_manager: ResMut<BlasManager>,
     mut bindings: ResMut<RaytracingSceneBindings>,
@@ -503,7 +504,9 @@ pub fn prepare_raytracing_skins(
         .collect();
     command_encoder.build_acceleration_structures(&entries, &[]);
     drop(entries);
-    render_queue.submit([command_encoder.finish()]);
+    // Submitted with the frame's passes, and ahead of them: a submission of its own every
+    // frame that anything skinned moves costs the renderer more than the skinning does.
+    pending_command_buffers.push_encoder(command_encoder, "solari_skinning");
 
     for (entity, .., next) in work {
         let instance = skins.instances.get_mut(&entity).unwrap();

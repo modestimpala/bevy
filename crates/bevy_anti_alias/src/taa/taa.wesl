@@ -181,9 +181,16 @@ fn taa(@location(0) uv: vec2<f32>) -> Output {
     let previous_clip = previous_view.clip_from_world * (view.world_from_clip * current_clip);
     let expected_depth = previous_clip.z / previous_clip.w;
     let history_depth = textureSample(history, nearest_sampler, history_uv).a;
+    // What moves of itself is not where the camera's motion alone would have it. How far
+    // it has moved across the view is known from its motion vector, less the camera's
+    // share of it; it is allowed to have moved in depth about as far, as a share of its
+    // distance. Without this whatever moves in depth has no history while it moves.
+    let camera_motion = uv - (previous_clip.xy / previous_clip.w * vec2(0.5, -0.5) + 0.5);
+    let own_pixels = length((closest_motion_vector - camera_motion) * texture_size);
+    let own_motion = max(own_pixels - 1.0, 0.0) * 2.0 / (view.clip_from_view[1][1] * texture_size.y);
     // Allow depth quantization and subpixel sampling on slopes, but cap the slope
     // allowance so a silhouette discontinuity cannot validate unrelated history.
-    let depth_tolerance = max(abs(expected_depth) * 0.01
+    let depth_tolerance = max(abs(expected_depth) * (0.01 + 2.0 * own_motion)
         + min(fwidth(expected_depth), abs(expected_depth) * 0.01), 0.000001);
     let sky_changed = (current_depth == 0.0) != (history_depth == 0.0);
     let surface_changed = current_depth != 0.0

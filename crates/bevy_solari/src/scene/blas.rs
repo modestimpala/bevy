@@ -29,7 +29,14 @@ const TLAS_BUILDS_BEFORE_DELETION_ALLOWED: usize = 2;
 #[derive(Resource, Default)]
 pub struct BlasManager {
     blas: HashMap<AssetId<Mesh>, Blas>,
-    compaction_queue: VecDeque<(AssetId<Mesh>, u32, bool)>,
+    /// Structures waiting to be compacted: the mesh, its vertex count, whether compaction has
+    /// been asked for, and which build of the mesh's structure it was asked of.
+    compaction_queue: VecDeque<(AssetId<Mesh>, u32, bool, u64)>,
+    /// The build of each mesh's structure that is waiting to be compacted. A mesh built again
+    /// or removed since leaves its older entries in the queue with nothing to wait for; they
+    /// are dropped when they come up, and not asked after every frame for good.
+    awaiting_compaction: HashMap<AssetId<Mesh>, u64>,
+    builds: u64,
     changed: Vec<AssetId<Mesh>>,
     /// BLAS that are pending deletion, one batch per TLAS build. The back batch collects
     /// retirements since the last build, and every batch ahead of it has one more build to wait
@@ -66,6 +73,7 @@ impl BlasManager {
 
     fn remove(&mut self, mesh: AssetId<Mesh>) {
         self.changed.push(mesh);
+        self.awaiting_compaction.remove(&mesh);
 
         if let Some(removed) = self.blas.remove(&mesh) {
             self.retire(removed);
@@ -121,9 +129,15 @@ pub fn prepare_raytracing_blas(
                 allocate_blas(&vertex_slice, &index_slice, asset_id, &render_device);
 
             blas_manager.insert(*asset_id, blas);
-            blas_manager
-                .compaction_queue
-                .push_back((*asset_id, blas_size.vertex_count, false));
+            blas_manager.builds += 1;
+            let build = blas_manager.builds;
+            blas_manager.awaiting_compaction.insert(*asset_id, build);
+            blas_manager.compaction_queue.push_back((
+                *asset_id,
+                blas_size.vertex_count,
+                false,
+                build,
+            ));
 
             (*asset_id, vertex_slice, index_slice, blas_size)
         })
@@ -177,8 +191,13 @@ pub fn compact_raytracing_blas(
     {
         meshes_processed += 1;
 
-        let (mesh, vertex_count, compaction_started) =
+        let (mesh, vertex_count, compaction_started, build) =
             blas_manager.compaction_queue.pop_front().unwrap();
+
+        // The mesh has been built again or removed since: this is not its structure.
+        if blas_manager.awaiting_compaction.get(&mesh) != Some(&build) {
+            continue;
+        }
 
         let Some(blas) = blas_manager.get(&mesh) else {
             continue;
@@ -191,6 +210,7 @@ pub fn compact_raytracing_blas(
         if blas.ready_for_compaction() {
             let compacted_blas = render_queue.compact_blas(blas);
             blas_manager.insert(mesh, compacted_blas);
+            blas_manager.awaiting_compaction.remove(&mesh);
 
             vertices_compacted += vertex_count;
             continue;
@@ -199,7 +219,7 @@ pub fn compact_raytracing_blas(
         // BLAS not ready for compaction, put back in queue
         blas_manager
             .compaction_queue
-            .push_back((mesh, vertex_count, true));
+            .push_back((mesh, vertex_count, true, build));
     }
 }
 

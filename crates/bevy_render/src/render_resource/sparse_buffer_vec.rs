@@ -944,9 +944,24 @@ fn note_changed_index(index: u32, summary: &[AtomicU64], dirty_bits: &[AtomicU64
         dirty_word_index / BITS_PER_WORD,
         dirty_word_index % BITS_PER_WORD,
     );
-    summary[summary_word_index as usize].fetch_or(1 << summary_bit_offset, Ordering::Relaxed);
+    // Many threads note changes at once, and a word of the summary stands for 4096 elements.
+    // A write takes the word's cache line from every other thread that has it, where a read
+    // shares it: so look before writing, which after the first change in a block is all that
+    // is done.
+    set_bit(
+        &summary[summary_word_index as usize],
+        1 << summary_bit_offset,
+    );
     let (element_word, element_in_word) = (index / BITS_PER_WORD, index % BITS_PER_WORD);
-    dirty_bits[element_word as usize].fetch_or(1 << element_in_word, Ordering::Relaxed);
+    set_bit(&dirty_bits[element_word as usize], 1 << element_in_word);
+}
+
+/// Sets `bit` in `word`, writing only if it isn't set already.
+#[inline]
+fn set_bit(word: &AtomicU64, bit: u64) {
+    if word.load(Ordering::Relaxed) & bit == 0 {
+        word.fetch_or(bit, Ordering::Relaxed);
+    }
 }
 
 /// Returns the total number of bits set in `dirty_bits`, using the given

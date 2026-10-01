@@ -31,6 +31,7 @@ use bevy_math::{Affine3A, Mat4};
 use bevy_mesh::{skinning::SkinnedMesh, Mesh, MeshVertexAttribute, VertexFormat};
 use bevy_pbr::SkinUniforms;
 use bevy_render::{
+    diagnostic::{DiagnosticsRecorder, RecordDiagnostics},
     mesh::{allocator::MeshAllocator, RenderMesh, RenderMeshBufferInfo},
     render_asset::RenderAssets,
     render_resource::{
@@ -277,7 +278,9 @@ fn create_instance(
         render_device.wgpu_device().create_blas(
             &CreateBlasDescriptor {
                 label: Some("solari_skinned_blas"),
-                flags: AccelerationStructureFlags::PREFER_FAST_TRACE,
+                // Rebuilt whenever the skin moves, which is most frames: a quick build is
+                // worth more than a quicker trace.
+                flags: AccelerationStructureFlags::PREFER_FAST_BUILD,
                 update_mode: AccelerationStructureUpdateMode::Build,
             },
             BlasGeometrySizeDescriptors::Triangles {
@@ -322,6 +325,7 @@ pub fn prepare_raytracing_skins(
     mut skins: ResMut<RaytracingSkins>,
     mut blas_manager: ResMut<BlasManager>,
     mut bindings: ResMut<RaytracingSceneBindings>,
+    mut diagnostics: Option<ResMut<DiagnosticsRecorder>>,
 ) {
     let skins = &mut *skins;
     skins.moved.clear();
@@ -465,16 +469,12 @@ pub fn prepare_raytracing_skins(
     let mut command_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("solari_skinning_command_encoder"),
     });
-    {
-        let mut pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("solari_skinning"),
-            timestamp_writes: None,
-        });
-        for (_, pipeline, bind_group, workgroups, ..) in &work {
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
-            pass.dispatch_workgroups(*workgroups, 1, 1);
-        }
+    if let Some(diagnostics) = diagnostics.as_mut() {
+        let time_span = diagnostics.time_span(&mut command_encoder, "solari_skinning");
+        skin(&mut command_encoder, &work);
+        time_span.end(&mut command_encoder);
+    } else {
+        skin(&mut command_encoder, &work);
     }
     let geometries: Vec<_> = work
         .iter()
@@ -502,7 +502,13 @@ pub fn prepare_raytracing_skins(
             geometry: BlasGeometries::TriangleGeometries(vec![geometry]),
         })
         .collect();
-    command_encoder.build_acceleration_structures(&entries, &[]);
+    if let Some(diagnostics) = diagnostics.as_mut() {
+        let time_span = diagnostics.time_span(&mut command_encoder, "skinned_blas_build");
+        command_encoder.build_acceleration_structures(&entries, &[]);
+        time_span.end(&mut command_encoder);
+    } else {
+        command_encoder.build_acceleration_structures(&entries, &[]);
+    }
     drop(entries);
     // Submitted with the frame's passes, and ahead of them: a submission of its own every
     // frame that anything skinned moves costs the renderer more than the skinning does.
@@ -516,5 +522,21 @@ pub fn prepare_raytracing_skins(
         }
         instance.current = Some(next);
         skins.moved.push(entity);
+    }
+}
+
+/// Records the skinning dispatches of this frame's moved instances.
+fn skin(
+    command_encoder: &mut CommandEncoder,
+    work: &[(Entity, &ComputePipeline, BindGroup, u32, Buffer, u32, usize)],
+) {
+    let mut pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
+        label: Some("solari_skinning"),
+        timestamp_writes: None,
+    });
+    for (_, pipeline, bind_group, workgroups, ..) in work {
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.dispatch_workgroups(*workgroups, 1, 1);
     }
 }

@@ -90,6 +90,11 @@ fn pbr_input_from_standard_material(
 @else
     let deferred_lighting_pass_id = pbr_bindings::material.deferred_lighting_pass_id;
 @if(BINDLESS)
+    let deferred_material_tag =
+        pbr_bindings::material_array[material_indices[slot].material].deferred_material_tag;
+@else
+    let deferred_material_tag = pbr_bindings::material.deferred_material_tag;
+@if(BINDLESS)
     let alpha_cutoff = pbr_bindings::material_array[material_indices[slot].material].alpha_cutoff;
 @else
     let alpha_cutoff = pbr_bindings::material.alpha_cutoff;
@@ -100,6 +105,7 @@ fn pbr_input_from_standard_material(
     pbr_input.material.flags = flags;
     pbr_input.material.base_color *= base_color;
     pbr_input.material.deferred_lighting_pass_id = deferred_lighting_pass_id;
+    pbr_input.material.deferred_material_tag = deferred_material_tag;
     let is_logically_front = pbr_functions::winding_corrected_front_facing(pbr_input.flags, is_front);
 
     // Neubelt and Pettineo 2013, "Crafting a Next-gen Material Pipeline for The Order: 1886"
@@ -231,6 +237,31 @@ pbr_input.material.uv_transform = uv_transform;
     pbr_input.material.flags = flags;
     pbr_input.material.alpha_cutoff = alpha_cutoff;
 
+@if(VERTEX_UVS)
+    // Lit materials decode the tag while sampling their physical properties below.
+    // Unlit materials still need the tag even though they otherwise skip that texture.
+    if ((flags & pbr_types::STANDARD_MATERIAL_FLAGS_UNLIT_BIT) != 0u
+        && (flags & pbr_types::STANDARD_MATERIAL_FLAGS_METALLIC_ROUGHNESS_TEXTURE_BIT) != 0u
+        && (flags & pbr_types::STANDARD_MATERIAL_FLAGS_DEFERRED_MATERIAL_TAG_FROM_TEXTURE_BIT) != 0u) {
+        @if(BINDLESS)
+        let texture = bindless_textures_2d[material_indices[slot].metallic_roughness_texture];
+        @else
+        let texture = pbr_bindings::metallic_roughness_texture;
+        @if(BINDLESS)
+        let sampler_ = bindless_samplers_filtering[material_indices[slot].metallic_roughness_sampler];
+        @else
+        let sampler_ = pbr_bindings::metallic_roughness_sampler;
+        @if(STANDARD_MATERIAL_METALLIC_ROUGHNESS_UV_B)
+        let coords = uv_b;
+        @else
+        let coords = uv;
+        @if(MESHLET_MESH_MATERIAL_PASS)
+        let encoded_tag = textureSampleGrad(texture, sampler_, coords, bias.ddx_uv, bias.ddy_uv).r;
+        @else
+        let encoded_tag = textureSampleBias(texture, sampler_, coords, bias.mip_bias).r;
+        pbr_input.material.deferred_material_tag = u32(round(saturate(encoded_tag) * 31.0));
+    }
+
     // NOTE: Unlit bit not set means == 0 is true, so the true case is if lit
     if ((flags & pbr_types::STANDARD_MATERIAL_FLAGS_UNLIT_BIT) == 0u) {
 @if(BINDLESS) {
@@ -356,6 +387,10 @@ pbr_input.material.uv_transform = uv_transform;
             let metallic_roughness = textureSampleGrad(texture, sampler_, coords, bias.ddx_uv, bias.ddy_uv);
             @else
             let metallic_roughness = textureSampleBias(texture, sampler_, coords, bias.mip_bias);
+            if ((flags & pbr_types::STANDARD_MATERIAL_FLAGS_DEFERRED_MATERIAL_TAG_FROM_TEXTURE_BIT) != 0u) {
+                pbr_input.material.deferred_material_tag =
+                    u32(round(saturate(metallic_roughness.r) * 31.0));
+            }
             if ((flags & pbr_types::STANDARD_MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG_BIT) != 0u) {
                 perceptual_roughness *= metallic_roughness.r;
                 metallic *= metallic_roughness.g;

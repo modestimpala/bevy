@@ -78,7 +78,11 @@ fn deferred_gbuffer_from_pbr_input(in: PbrInput) -> vec4<u32> {
         deferred_types::pack_unorm4x8_(vec4(base_color_srgb, in.material.perceptual_roughness)),
         rgb9e5::vec3_to_rgb9e5_(emissive),
         props,
-        deferred_types::pack_24bit_normal_and_flags(octahedral_normal, flags),
+        deferred_types::pack_24bit_normal_and_flags(
+            octahedral_normal,
+            flags,
+            in.material.deferred_material_tag,
+        ),
     );
     return deferred;
 }
@@ -91,6 +95,8 @@ fn pbr_input_from_deferred_gbuffer(frag_coord: vec4<f32>, gbuffer: vec4<u32>) ->
     let deferred_flags = deferred_types::mesh_material_flags_from_deferred_flags(flags);
     pbr.flags = deferred_flags.x;
     pbr.material.flags = deferred_flags.y;
+    pbr.material.deferred_material_tag =
+        deferred_types::unpack_deferred_material_tag(gbuffer.a);
 
     let base_rough = deferred_types::unpack_unorm4x8_(gbuffer.r);
     pbr.material.perceptual_roughness = base_rough.a;

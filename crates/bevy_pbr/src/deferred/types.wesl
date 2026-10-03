@@ -30,14 +30,21 @@ const U16MAXF = 65535.0;
 const U20MAXF = 1048575.0;
 
 // Storing normals as oct24.
-// Flags are stored in the remaining 8 bits.
+// The low 3 bits of the remaining byte store flags; its high 5 bits store the
+// application-defined deferred material tag.
 // https://jcgt.org/published/0003/02/01/paper.pdf
-// Could possibly go down to oct20 if the space is needed.
 
-fn pack_24bit_normal_and_flags(octahedral_normal: vec2<f32>, flags: u32) -> u32 {
+fn pack_24bit_normal_and_flags(
+    octahedral_normal: vec2<f32>,
+    flags: u32,
+    deferred_material_tag: u32,
+) -> u32 {
     let unorm1 = u32(saturate(octahedral_normal.x) * U12MAXF + 0.5);
     let unorm2 = u32(saturate(octahedral_normal.y) * U12MAXF + 0.5);
-    return (unorm1 & 0xFFFu) | ((unorm2 & 0xFFFu) << 12u) | ((flags & 0xFFu) << 24u);
+    return (unorm1 & 0xFFFu)
+        | ((unorm2 & 0xFFFu) << 12u)
+        | ((flags & 0x7u) << 24u)
+        | ((deferred_material_tag & 0x1Fu) << 27u);
 }
 
 fn unpack_24bit_normal(packed: u32) -> vec2<f32> {
@@ -47,7 +54,11 @@ fn unpack_24bit_normal(packed: u32) -> vec2<f32> {
 }
 
 fn unpack_flags(packed: u32) -> u32 {
-    return (packed >> 24u) & 0xFFu;
+    return (packed >> 24u) & 0x7u;
+}
+
+fn unpack_deferred_material_tag(packed: u32) -> u32 {
+    return packed >> 27u;
 }
 
 /// The builtin one didn't work in webgl.

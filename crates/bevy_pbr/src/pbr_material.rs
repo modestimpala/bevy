@@ -151,11 +151,13 @@ pub struct StandardMaterial {
 
     /// Metallic and roughness maps, stored as a single texture.
     ///
-    /// The blue channel contains metallic values,
-    /// and the green channel contains the roughness values.
-    /// Other channels are unused.
+    /// For three- and four-channel images, the blue channel contains metallic values and
+    /// the green channel contains roughness values. The red channel is unused by PBR and
+    /// can optionally store [`StandardMaterial::deferred_material_tag`] normalized by `31`;
+    /// see [`StandardMaterial::deferred_material_tag_from_texture`]. The alpha channel is
+    /// unused.
     ///
-    /// A two-channel image has no blue channel, so it is read as red = roughness,
+    /// A two-channel image has no blue channel, so it is read as red = roughness and
     /// green = metallic instead.
     ///
     /// Those values are multiplied by the scalar ones of the material,
@@ -786,6 +788,18 @@ pub struct StandardMaterial {
     /// PBR deferred lighting pass. Ignored in the case of forward materials.
     pub deferred_lighting_pass_id: u8,
 
+    /// Application-defined material tag written to the deferred G-buffer.
+    ///
+    /// Values are clamped to the 5-bit range `0..=31`. The default tag is `0`.
+    pub deferred_material_tag: u32,
+
+    /// Whether to read [`StandardMaterial::deferred_material_tag`] from the red channel of
+    /// [`StandardMaterial::metallic_roughness_texture`] instead of the scalar value.
+    ///
+    /// The channel stores the tag normalized by `31`. Opting in does not change how the
+    /// green roughness and blue metallic channels are sampled. Defaults to `false`.
+    pub deferred_material_tag_from_texture: bool,
+
     /// The transform applied to the UVs corresponding to `ATTRIBUTE_UV_0` on the mesh before sampling. Default is identity.
     pub uv_transform: Affine2,
 }
@@ -942,6 +956,8 @@ impl Default for StandardMaterial {
             parallax_mapping_method: ParallaxMappingMethod::Occlusion,
             opaque_render_method: OpaqueRendererMethod::Auto,
             deferred_lighting_pass_id: DEFAULT_PBR_DEFERRED_LIGHTING_PASS_ID,
+            deferred_material_tag: 0,
+            deferred_material_tag_from_texture: false,
             uv_transform: Affine2::IDENTITY,
         }
     }
@@ -1004,6 +1020,7 @@ bitflags::bitflags! {
         const SPECULAR_TEXTURE           = 1 << 18;
         const SPECULAR_TINT_TEXTURE      = 1 << 19;
         const METALLIC_ROUGHNESS_RG      = 1 << 20; // Roughness in red, metallic in green
+        const DEFERRED_MATERIAL_TAG_FROM_TEXTURE = 1 << 21;
         const ALPHA_MODE_RESERVED_BITS   = Self::ALPHA_MODE_MASK_BITS << Self::ALPHA_MODE_SHIFT_BITS; // ← Bitmask reserving bits for the `AlphaMode`
         const ALPHA_MODE_OPAQUE          = 0 << Self::ALPHA_MODE_SHIFT_BITS;                          // ← Values are just sequential values bitshifted into
         const ALPHA_MODE_MASK            = 1 << Self::ALPHA_MODE_SHIFT_BITS;                          //   the bitmask, and can range from 0 to 7.
@@ -1076,6 +1093,8 @@ pub struct StandardMaterialUniform {
     pub max_relief_mapping_search_steps: u32,
     /// ID for specifying which deferred lighting pass should be used for rendering this material, if any.
     pub deferred_lighting_pass_id: u32,
+    /// Application-defined 5-bit material tag written to the deferred G-buffer.
+    pub deferred_material_tag: u32,
 }
 
 impl AsBindGroupShaderType<StandardMaterialUniform> for StandardMaterial {
@@ -1099,6 +1118,9 @@ impl AsBindGroupShaderType<StandardMaterialUniform> for StandardMaterial {
             }) {
                 flags |= StandardMaterialFlags::METALLIC_ROUGHNESS_RG;
             }
+        }
+        if self.deferred_material_tag_from_texture {
+            flags |= StandardMaterialFlags::DEFERRED_MATERIAL_TAG_FROM_TEXTURE;
         }
         if self.occlusion_texture.is_some() {
             flags |= StandardMaterialFlags::OCCLUSION_TEXTURE;
@@ -1242,6 +1264,7 @@ impl AsBindGroupShaderType<StandardMaterialUniform> for StandardMaterial {
             lightmap_exposure: self.lightmap_exposure,
             max_relief_mapping_search_steps: self.parallax_mapping_method.max_steps(),
             deferred_lighting_pass_id: self.deferred_lighting_pass_id as u32,
+            deferred_material_tag: self.deferred_material_tag.min(31),
             uv_transform: self.uv_transform.into(),
         }
     }

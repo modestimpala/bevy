@@ -77,6 +77,17 @@ impl AssetState {
         }
     }
 
+    /// The luminance of the material in `slot`'s emissive colour. A texture can only dim it.
+    pub fn emission(&self, slot: u32) -> f32 {
+        if slot >= self.materials.len() {
+            return 0.0;
+        }
+        self.materials
+            .get(slot)
+            .emissive
+            .dot(Vec3::new(0.2126, 0.7152, 0.0722))
+    }
+
     pub fn update_materials(
         &mut self,
         instances: &mut InstanceState,

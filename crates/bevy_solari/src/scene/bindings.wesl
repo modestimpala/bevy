@@ -10,6 +10,7 @@ struct InstanceGeometryIds {
     index_buffer_id: u32,
     index_buffer_offset: u32,
     triangle_count: u32,
+    light_probability: f32,
 }
 
 struct VertexBuffer { vertices: array<PackedVertex> }
@@ -63,6 +64,9 @@ const MIRROR_ROUGHNESS_THRESHOLD = 0.001f;
 struct LightSource {
     kind: u32, // 1 bit for kind, 31 bits for extra data
     id: u32,
+    probability: f32, // Chance of a light sample picking this light
+    threshold: f32, // Alias table: a sample landing on this slot keeps this light with this chance,
+    alias_light: u32, // and otherwise takes this one
 }
 
 const LIGHT_SOURCE_KIND_EMISSIVE_MESH = 0u;
@@ -106,6 +110,8 @@ const RAY_T_MIN = 0.001f;
 const RAY_T_MAX = 100000.0f;
 
 const RAY_NO_CULL = 0xFFu;
+// Leaves out the instances that cast no shadow, whose mask is the one bit this lacks
+const RAY_CULL_SHADOWLESS = 0xFEu;
 
 fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32) -> RayIntersection {
     let ray = RayDesc(ray_flag, RAY_NO_CULL, ray_t_min, ray_t_max, ray_origin, ray_direction);
@@ -121,6 +127,23 @@ fn trace_ray_previous_frame(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray
     rayQueryInitialize(&rq, previous_frame_tlas, ray);
     rayQueryProceed(&rq);
     return rayQueryGetCommittedIntersection(&rq);
+}
+
+/// Whether anything that casts a shadow lies along the ray.
+fn trace_shadow_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32) -> bool {
+    let ray = RayDesc(RAY_FLAG_TERMINATE_ON_FIRST_HIT, RAY_CULL_SHADOWLESS, ray_t_min, ray_t_max, ray_origin, ray_direction);
+    var rq: ray_query;
+    rayQueryInitialize(&rq, tlas, ray);
+    rayQueryProceed(&rq);
+    return rayQueryGetCommittedIntersection(&rq).kind != RAY_QUERY_INTERSECTION_NONE;
+}
+
+fn trace_shadow_ray_previous_frame(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32) -> bool {
+    let ray = RayDesc(RAY_FLAG_TERMINATE_ON_FIRST_HIT, RAY_CULL_SHADOWLESS, ray_t_min, ray_t_max, ray_origin, ray_direction);
+    var rq: ray_query;
+    rayQueryInitialize(&rq, previous_frame_tlas, ray);
+    rayQueryProceed(&rq);
+    return rayQueryGetCommittedIntersection(&rq).kind != RAY_QUERY_INTERSECTION_NONE;
 }
 
 fn sample_texture(id: u32, uv: vec2<f32>) -> vec3<f32> {
@@ -145,6 +168,7 @@ struct ResolvedRayHitFull {
     uv: vec2<f32>,
     triangle_area: f32,
     triangle_count: u32,
+    light_probability: f32,
     material: ResolvedMaterial,
     double_sided: bool,
 }
@@ -275,6 +299,8 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
         uv,
         triangle_area,
         instance_geometry_ids.triangle_count,
+        // Light samples only pick among the instance's first triangle_count triangles
+        select(0.0, instance_geometry_ids.light_probability, triangle_id < instance_geometry_ids.triangle_count),
         resolved_material,
         (material.flags & MATERIAL_FLAG_DOUBLE_SIDED) != 0u,
     );

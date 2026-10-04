@@ -24,12 +24,16 @@ use super::{
 use bevy_ecs::{
     entity::Entity,
     lifecycle::RemovedComponents,
+    query::With,
     resource::Resource,
     system::{Query, Res, ResMut},
     world::{FromWorld, World},
 };
+use bevy_math::Vec3;
 use bevy_pbr::ExtractedDirectionalLight;
 use bevy_render::{
+    camera::ExtractedCamera,
+    view::ExtractedView,
     mesh::allocator::MeshAllocator,
     render_asset::{ExtractedAssets, RenderAssets},
     render_resource::{binding_types::*, *},
@@ -138,7 +142,10 @@ pub fn prepare_raytracing_scene_resources(
     instances: Query<InstanceQueryData>,
     changed_instances: Query<Entity, ChangedInstanceFilter>,
     mut removed_instances: RemovedComponents<RaytracingMesh3d>,
-    directional_lights: Query<(Entity, &ExtractedDirectionalLight)>,
+    (directional_lights, viewers): (
+        Query<(Entity, &ExtractedDirectionalLight)>,
+        Query<&ExtractedView, With<ExtractedCamera>>,
+    ),
     needs_previous_frame_data: Option<Res<RaytracingSceneNeedsPreviousFrameData>>,
     mesh_allocator: Res<MeshAllocator>,
     blas_manager: Res<BlasManager>,
@@ -189,6 +196,16 @@ pub fn prepare_raytracing_scene_resources(
 
     // Update the light set, now that emissive instances are resolved
     bindings.lights.update(&directional_lights);
+    let viewers: Vec<Vec3> = viewers
+        .iter()
+        .map(|view| view.world_from_view.translation())
+        .collect();
+    bindings.lights.weigh(
+        &bindings.instances,
+        &bindings.assets,
+        &blas_manager,
+        &viewers,
+    );
 
     // Upload the above writes
     write_sparse_buffers(bindings, &render_device, &render_queue);

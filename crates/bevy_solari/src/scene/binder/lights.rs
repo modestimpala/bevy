@@ -1,4 +1,5 @@
-use super::allocator::SlotAllocator;
+use super::{allocator::SlotAllocator, assets::AssetState, instances::InstanceState};
+use crate::scene::blas::BlasManager;
 use bevy_color::ColorToComponents;
 use bevy_ecs::{
     entity::{Entity, EntityHashSet},
@@ -16,11 +17,28 @@ use tracing::info_span;
 
 const LIGHT_NOT_PRESENT_THIS_FRAME: u32 = u32::MAX;
 
+/// A light sample names its triangle in sixteen bits.
+pub const MAX_EMISSIVE_MESH_TRIANGLES: u32 = u16::MAX as u32;
+
+/// The share of light samples spread evenly over the lights. The rest go to each light by how
+/// much light it is reckoned to give.
+///
+/// That reckoning knows nothing of what stands between a light and what it lights, so a light
+/// it rates low can still be the one that matters. The even share bounds the harm: no light is
+/// picked less than this share of what an even choice would give it.
+const EVEN_SHARE: f32 = 0.5;
+
 #[derive(Clone, Copy, Default, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct GpuLightSource {
     kind: u32,
     id: u32,
+    /// The chance of a light sample picking this light.
+    probability: f32,
+    /// This slot of the alias table: a sample that lands on it keeps this light with chance
+    /// `threshold`, and otherwise takes the light `alias`.
+    threshold: f32,
+    alias: u32,
 }
 
 /// Stable identity for one source in the light array.
@@ -88,13 +106,12 @@ impl LightIndex {
 
 impl GpuLightSource {
     pub fn new_emissive_mesh_light(instance_id: u32, triangle_count: u32) -> GpuLightSource {
-        if triangle_count > u16::MAX as u32 {
-            panic!("Too many triangles ({triangle_count}) in an emissive mesh, maximum is 65535.");
-        }
+        debug_assert!(triangle_count <= MAX_EMISSIVE_MESH_TRIANGLES);
 
         Self {
             kind: triangle_count << 1,
             id: instance_id,
+            ..Default::default()
         }
     }
 
@@ -102,6 +119,7 @@ impl GpuLightSource {
         Self {
             kind: 1,
             id: directional_light_id,
+            ..Default::default()
         }
     }
 }
@@ -119,6 +137,11 @@ impl_atomic_pod!(GpuLightSource, GpuLightSourceBlob);
 impl_atomic_pod!(GpuDirectionalLight, GpuDirectionalLightBlob);
 
 impl GpuDirectionalLight {
+    /// The illuminance of a surface facing the light.
+    fn illuminance(&self) -> f32 {
+        (self.luminance * self.inverse_pdf).dot(LUMINANCE)
+    }
+
     fn new(directional_light: &ExtractedDirectionalLight) -> Self {
         let cos_theta_max = cos(directional_light.sun_disk_angular_size / 2.0);
         let solid_angle = TAU * (1.0 - cos_theta_max);
@@ -147,6 +170,9 @@ pub struct LightState {
     directional_slots: SlotAllocator<Entity>,
     /// Set by the lighting node once it has recorded work reading the translation table.
     translations_consumed: AtomicBool,
+    /// Scratch for [`Self::weigh`].
+    weights: Vec<f32>,
+    alias_table: AliasTable,
 }
 
 impl LightState {
@@ -169,6 +195,68 @@ impl LightState {
             nonidentity_translations: Vec::new(),
             directional_slots: SlotAllocator::new(),
             translations_consumed: AtomicBool::new(false),
+            weights: Vec::new(),
+            alias_table: AliasTable::default(),
+        }
+    }
+
+    /// Reckons how much light each source gives the viewers, and from that the chance of a
+    /// light sample picking it.
+    ///
+    /// A directional light is weighed by its illuminance, and an emissive mesh by the
+    /// illuminance its surface would give a viewer facing it: luminance times area over distance
+    /// squared. Without that a sun among a few hundred small flames gets one sample in a few
+    /// hundred.
+    pub fn weigh(
+        &mut self,
+        instances: &InstanceState,
+        assets: &AssetState,
+        blas_manager: &BlasManager,
+        viewers: &[Vec3],
+    ) {
+        let _span = info_span!("weigh_lights").entered();
+
+        self.weights.clear();
+        for (index, id) in self.index.ids.iter().enumerate() {
+            let weight = match *id {
+                LightSourceId::Directional(_) => {
+                    let slot = self.sources.get(index as u32).id;
+                    self.directional_lights.get(slot).illuminance()
+                }
+                LightSourceId::EmissiveMesh(entity) => instances
+                    .emitter(entity, assets, blas_manager)
+                    .map_or(0.0, |(_, centre, area, luminance)| {
+                        let distance_squared = viewers
+                            .iter()
+                            .map(|viewer| viewer.distance_squared(centre))
+                            .reduce(f32::min)
+                            .unwrap_or(1.0);
+                        // Close to, a surface gives no more than a sky of its own luminance
+                        luminance * area / (distance_squared + area).max(f32::MIN_POSITIVE)
+                    }),
+            };
+            self.weights.push(weight);
+        }
+
+        self.alias_table.build(&self.weights, EVEN_SHARE);
+
+        for (index, id) in self.index.ids.iter().enumerate() {
+            let index = index as u32;
+            let (probability, threshold, alias) = self.alias_table.slot(index as usize);
+            self.sources.set_if_changed(
+                index,
+                GpuLightSource {
+                    probability,
+                    threshold,
+                    alias,
+                    ..self.sources.get(index)
+                },
+            );
+            if let LightSourceId::EmissiveMesh(entity) = *id
+                && let Some((slot, ..)) = instances.emitter(entity, assets, blas_manager)
+            {
+                instances.set_light_probability(slot, probability);
+            }
         }
     }
 
@@ -282,10 +370,139 @@ impl LightState {
     }
 }
 
+const LUMINANCE: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
+
+/// A table that picks one of many things by weight in constant time: pick a slot evenly, keep
+/// its own thing with the slot's threshold as the chance, and otherwise take its alias.
+#[derive(Default)]
+struct AliasTable {
+    probabilities: Vec<f32>,
+    thresholds: Vec<f32>,
+    aliases: Vec<u32>,
+    small: Vec<u32>,
+    large: Vec<u32>,
+}
+
+impl AliasTable {
+    /// Builds the table over `weights`, with `even_share` of the choices spread evenly instead.
+    fn build(&mut self, weights: &[f32], even_share: f32) {
+        let count = weights.len();
+        let usable = |weight: &f32| weight.is_finite() && *weight > 0.0;
+        let total: f64 = weights
+            .iter()
+            .filter(|weight| usable(weight))
+            .map(|weight| *weight as f64)
+            .sum();
+        // With nothing to weigh by, every light has the same chance
+        let even_share = if total > 0.0 && total.is_finite() {
+            even_share as f64
+        } else {
+            1.0
+        };
+
+        self.probabilities.clear();
+        self.probabilities.extend(weights.iter().map(|weight| {
+            let by_weight = if usable(weight) && even_share < 1.0 {
+                *weight as f64 / total
+            } else {
+                0.0
+            };
+            (even_share / count as f64 + (1.0 - even_share) * by_weight) as f32
+        }));
+
+        // Vose's method: each slot holds an even share of the whole, part its own light's and
+        // the rest topped up from a light with more than an even share
+        self.thresholds.clear();
+        self.thresholds.extend(
+            self.probabilities
+                .iter()
+                .map(|probability| probability * count as f32),
+        );
+        self.aliases.clear();
+        self.aliases.extend(0..count as u32);
+        self.small.clear();
+        self.large.clear();
+        for (index, threshold) in self.thresholds.iter().enumerate() {
+            if *threshold < 1.0 {
+                self.small.push(index as u32);
+            } else {
+                self.large.push(index as u32);
+            }
+        }
+        while let (Some(&small), Some(&large)) = (self.small.last(), self.large.last()) {
+            self.small.pop();
+            self.aliases[small as usize] = large;
+            let left = self.thresholds[large as usize] - (1.0 - self.thresholds[small as usize]);
+            self.thresholds[large as usize] = left;
+            if left < 1.0 {
+                self.large.pop();
+                self.small.push(large);
+            }
+        }
+        // Whatever is left over is left by rounding, and holds a whole slot
+        for index in self.small.drain(..).chain(self.large.drain(..)) {
+            self.thresholds[index as usize] = 1.0;
+        }
+    }
+
+    /// A slot's light's chance of being picked, and the slot's threshold and alias.
+    fn slot(&self, index: usize) -> (f32, f32, u32) {
+        (
+            self.probabilities[index],
+            self.thresholds[index],
+            self.aliases[index],
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LightIndex, LightSourceId};
+    use super::{AliasTable, LightIndex, LightSourceId};
     use bevy_ecs::entity::Entity;
+
+    /// The chance the table as built gives each light, summed over the slots.
+    fn realised(table: &AliasTable, count: usize) -> Vec<f32> {
+        let mut chances = vec![0.0; count];
+        for index in 0..count {
+            let (_, threshold, alias) = table.slot(index);
+            chances[index] += threshold / count as f32;
+            chances[alias as usize] += (1.0 - threshold) / count as f32;
+        }
+        chances
+    }
+
+    #[test]
+    fn alias_table_picks_each_light_with_the_chance_it_states() {
+        let weights = [100_000.0, 3.0, 0.0, 12.0, f32::NAN, 0.5, 40.0];
+        let mut table = AliasTable::default();
+        table.build(&weights, 0.5);
+
+        let chances = realised(&table, weights.len());
+        let mut sum = 0.0;
+        for (index, chance) in chances.iter().enumerate() {
+            let (stated, threshold, _) = table.slot(index);
+            assert!((0.0..=1.0).contains(&threshold));
+            assert!(
+                (chance - stated).abs() < 1e-5,
+                "{index}: {chance} against {stated}"
+            );
+            // No light is picked less than half as often as an even choice would
+            assert!(stated >= 0.5 / weights.len() as f32 - 1e-6);
+            sum += stated;
+        }
+        assert!((sum - 1.0).abs() < 1e-5);
+        // The brightest by far takes nearly all of the weighted half
+        assert!(table.slot(0).0 > 0.5);
+    }
+
+    #[test]
+    fn alias_table_is_even_with_nothing_to_weigh_by() {
+        let mut table = AliasTable::default();
+        table.build(&[0.0; 5], 0.5);
+        for index in 0..5 {
+            assert_eq!(table.slot(index), (0.2, 1.0, index as u32));
+        }
+    }
 
     #[test]
     fn light_index_keeps_sources_on_the_same_entity_independent() {

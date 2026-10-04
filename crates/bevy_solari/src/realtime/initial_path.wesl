@@ -336,8 +336,7 @@ fn generate_emissive_candidate(
     rng: ptr<function, u32>,
 ) {
     let NdotV_hit = max(dot(ray_hit.world_normal, -wi), 0.0001);
-    let light_count = arrayLength(&light_sources);
-    let area_pdf = 1.0 / (f32(light_count) * f32(ray_hit.triangle_count) * ray_hit.triangle_area);
+    let area_pdf = ray_hit.light_probability / (f32(ray_hit.triangle_count) * ray_hit.triangle_area);
     let p_light = area_pdf * ray_t * ray_t / NdotV_hit;
     let p_nee = nee_probability((*path).material);
     let emissive_mis_weight = power_heuristic(p_brdf, p_light * p_nee * f32(di_samples));

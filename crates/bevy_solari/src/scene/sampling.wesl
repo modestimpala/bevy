@@ -1,7 +1,7 @@
 import bevy_pbr::render::pbr_lighting::D_GGX;
-import bevy_pbr::render::utils::{rand_vec2f, rand_u, rand_range_u};
+import bevy_pbr::render::utils::{rand_f, rand_vec2f, rand_u, rand_range_u};
 import bevy_render::maths::{PI_2, orthonormalize};
-import package::scene::bindings::{trace_ray, trace_ray_previous_frame, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, environment_map, environment_map_sampler, environment_map_light, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD};
+import package::scene::bindings::{trace_shadow_ray, trace_shadow_ray_previous_frame, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, environment_map, environment_map_sampler, environment_map_light, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD};
 
 enable wgpu_ray_query;
 
@@ -129,8 +129,7 @@ fn sample_random_light(ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, rn
 }
 
 fn random_emissive_light_pdf(hit: ResolvedRayHitFull, ray_distance: f32, NdotV: f32) -> f32 {
-    let light_count = arrayLength(&light_sources);
-    let area_pdf = 1.0 / (f32(light_count) * f32(hit.triangle_count) * hit.triangle_area);
+    let area_pdf = hit.light_probability / (f32(hit.triangle_count) * hit.triangle_area);
     return area_pdf * (ray_distance * ray_distance) / NdotV;
 }
 
@@ -145,8 +144,13 @@ fn sample_environment_map_light(world_direction: vec3<f32>) -> vec3<f32> {
 }
 
 fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightSampleResult {
+    // Lights are picked by how much light each gives, through an alias table: pick a slot
+    // evenly, then keep its light or take its alias
     let light_count = arrayLength(&light_sources);
-    let light_id = rand_range_u(light_count, rng);
+    var light_id = rand_range_u(light_count, rng);
+    if rand_f(rng) >= light_sources[light_id].threshold {
+        light_id = light_sources[light_id].alias_light;
+    }
 
     let light_source = light_sources[light_id];
 
@@ -160,7 +164,7 @@ fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightS
     let light_sample = LightSample((light_id << 16u) | triangle_id, seed);
 
     var resolved_light_sample = resolve_light_sample(light_sample, light_source);
-    resolved_light_sample.inverse_pdf *= f32(light_count);
+    resolved_light_sample.inverse_pdf /= light_source.probability;
 
     return GenerateRandomLightSampleResult(light_sample, resolved_light_sample);
 }
@@ -237,8 +241,7 @@ fn trace_visibility(ray_origin: vec3<f32>, point: vec4<f32>) -> f32 {
 
     if ray_t_max < RAY_T_MIN { return 0.0; }
 
-    let ray_hit = trace_ray(ray_origin, ray_direction, RAY_T_MIN, ray_t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
-    return f32(ray_hit.kind == RAY_QUERY_INTERSECTION_NONE);
+    return f32(!trace_shadow_ray(ray_origin, ray_direction, RAY_T_MIN, ray_t_max));
 }
 
 fn trace_visibility_previous_frame(ray_origin: vec3<f32>, point: vec4<f32>) -> f32 {
@@ -254,8 +257,7 @@ fn trace_visibility_previous_frame(ray_origin: vec3<f32>, point: vec4<f32>) -> f
 
     if ray_t_max < RAY_T_MIN { return 0.0; }
 
-    let ray_hit = trace_ray_previous_frame(ray_origin, ray_direction, RAY_T_MIN, ray_t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
-    return f32(ray_hit.kind == RAY_QUERY_INTERSECTION_NONE);
+    return f32(!trace_shadow_ray_previous_frame(ray_origin, ray_direction, RAY_T_MIN, ray_t_max));
 }
 
 /// https://www.realtimerendering.com/raytracinggems/unofficial_RayTracingGems_v1.9.pdf#0004286901.INDD%3ASec22%3A297

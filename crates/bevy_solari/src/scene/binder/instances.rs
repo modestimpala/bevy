@@ -1,17 +1,17 @@
 use super::{
     allocator::{IndexAllocator, RetainedBindingArray},
     assets::AssetState,
-    lights::{GpuLightSource, LightSourceId, LightState},
-    BlasKey, BlasManager, BlasOpacity, RaytracingMesh3d, RaytracingSceneBindings,
-    RaytracingSkins,
+    lights::{GpuLightSource, LightSourceId, LightState, MAX_EMISSIVE_MESH_TRIANGLES},
+    BlasKey, BlasManager, BlasOpacity, RaytracingMesh3d, RaytracingSceneBindings, RaytracingSkins,
 };
+use crate::scene::types::ExtractedRaytracingTraits;
 use bevy_asset::AssetId;
 use bevy_ecs::{
     entity::{Entity, EntityHashMap, EntityHashSet},
     query::{Changed, Or, With},
     system::Query,
 };
-use bevy_math::{Affine3, Affine3Ext, Vec4};
+use bevy_math::{Affine3, Affine3Ext, Vec3, Vec4};
 use bevy_mesh::Mesh;
 use bevy_pbr::{MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
 use bevy_platform::collections::HashMap;
@@ -35,7 +35,10 @@ pub struct GpuInstanceGeometryIds {
     vertex_buffer_offset: u32,
     index_buffer_id: u32,
     index_buffer_offset: u32,
+    /// How many of the mesh's triangles, from its first, a light sample picks among.
     triangle_count: u32,
+    /// The chance of a light sample picking this instance, or zero if it is not a light.
+    light_probability: f32,
 }
 
 /// A world-from-local affine transform, stored transposed as three rows.
@@ -50,15 +53,60 @@ impl GpuTransform {
     fn rows(self) -> [f32; 12] {
         bytemuck::cast(self)
     }
+
+    /// Where a point of the local space lies in the world.
+    fn point(self, local: Vec3) -> Vec3 {
+        let local = local.extend(1.0);
+        Vec3::new(
+            self.0[0].dot(local),
+            self.0[1].dot(local),
+            self.0[2].dot(local),
+        )
+    }
+
+    /// About how much larger an area is in the world than in the local space: the mean over the
+    /// three axis planes, which is exact for a uniform scale.
+    fn area_scale(self) -> f32 {
+        let [x, y, z] = [0, 1, 2]
+            .map(|axis| Vec3::new(self.0[0][axis], self.0[1][axis], self.0[2][axis]).length());
+        (x * y + y * z + z * x) / 3.0
+    }
 }
 
-/// The device address of a slot's acceleration structure. Zero marks an inactive slot.
+/// Every ray finds an instance with this mask.
+pub const INSTANCE_MASK_ALL: u32 = 0xFF;
+/// Rays that ask whether a light can be seen pass through an instance with this mask. It has to
+/// agree with `RAY_CULL_SHADOWLESS` in `bindings.wesl`.
+pub const INSTANCE_MASK_SHADOWLESS: u32 = 0x01;
+
+/// The device address of a slot's acceleration structure, and which rays find it. A zero address
+/// marks an inactive slot.
 #[derive(Clone, Copy, Default, PartialEq, Pod, Zeroable)]
-#[repr(transparent)]
-pub struct GpuBlasRef(u64);
+#[repr(C)]
+pub struct GpuBlasRef {
+    address: u64,
+    mask: u32,
+    _padding: u32,
+}
 
 impl GpuBlasRef {
-    const NONE: Self = Self(0);
+    const NONE: Self = Self {
+        address: 0,
+        mask: 0,
+        _padding: 0,
+    };
+
+    fn new(address: u64, mask: u32) -> Self {
+        Self {
+            address,
+            mask,
+            _padding: 0,
+        }
+    }
+
+    fn is_none(self) -> bool {
+        self.address == 0
+    }
 }
 
 impl_atomic_pod!(GpuInstanceGeometryIds, GpuInstanceGeometryIdsBlob);
@@ -77,6 +125,10 @@ struct Instance {
     material: AssetId<StandardMaterial>,
     opacity: BlasOpacity,
     buffers: Option<(BufferId, BufferId)>,
+    /// What the app says of how the mesh gives off light, and of whether it casts shadows.
+    traits: ExtractedRaytracingTraits,
+    /// The share of the mesh's triangles that light samples pick among.
+    emitting_share: f32,
 }
 
 impl Instance {
@@ -124,24 +176,62 @@ impl InstanceState {
         }
     }
 
-    /// Every drawable instance's slot, entity, acceleration structure key and world-from-local
-    /// transform.
+    /// Every drawable instance's slot, entity, acceleration structure key, ray mask and
+    /// world-from-local transform.
     ///
     /// Only the `wgpu-core` TLAS build path needs this, to fill in the instance descriptors that
     /// the raw path sets up on the GPU. Slots with a null acceleration structure reference are not
     /// currently drawable, and are left out.
-    pub fn drawable(&self) -> impl Iterator<Item = (u32, Entity, BlasKey, [f32; 12])> + '_ {
+    pub fn drawable(&self) -> impl Iterator<Item = (u32, Entity, BlasKey, u8, [f32; 12])> + '_ {
         self.records.iter().filter_map(|(&entity, instance)| {
             let slot = instance.slot;
-            (self.blas_refs.get(slot) != GpuBlasRef::NONE).then(|| {
+            let reference = self.blas_refs.get(slot);
+            (!reference.is_none()).then(|| {
                 (
                     slot,
                     entity,
                     instance.blas_key(),
+                    reference.mask as u8,
                     self.transforms.get(slot).rows(),
                 )
             })
         })
+    }
+
+    /// What a light sample would find of an emissive instance: its slot, where the middle of its
+    /// surface lies in the world, its area there and the luminance of its material.
+    pub fn emitter(
+        &self,
+        entity: Entity,
+        assets: &AssetState,
+        blas_manager: &BlasManager,
+    ) -> Option<(u32, Vec3, f32, f32)> {
+        let instance = self.records.get(&entity)?;
+        let surface = blas_manager.surface(&instance.mesh)?;
+        let transform = self.transforms.get(instance.slot);
+        Some((
+            instance.slot,
+            transform.point(surface.centre),
+            surface.area * instance.emitting_share * transform.area_scale(),
+            match instance.traits.emission {
+                Some(emission) => emission.luminance,
+                None => assets.emission(self.material_ids.get(instance.slot)),
+            },
+        ))
+    }
+
+    /// Records the chance of a light sample picking the instance in `slot`, for rays that hit it.
+    pub fn set_light_probability(&self, slot: u32, light_probability: f32) {
+        let geometry_ids = self.geometry_ids.get(slot);
+        if geometry_ids.light_probability != light_probability {
+            self.geometry_ids.set(
+                slot,
+                GpuInstanceGeometryIds {
+                    light_probability,
+                    ..geometry_ids
+                },
+            );
+        }
     }
 
     /// Points each skinned instance whose acceleration structure was rebuilt this frame at the
@@ -151,8 +241,9 @@ impl InstanceState {
             let Some(slot) = self.records.get(&entity).map(|instance| instance.slot) else {
                 continue;
             };
-            if self.blas_refs.get(slot) != GpuBlasRef::NONE {
-                self.set_blas_ref(slot, GpuBlasRef(address));
+            let reference = self.blas_refs.get(slot);
+            if !reference.is_none() {
+                self.set_blas_ref(slot, GpuBlasRef::new(address, reference.mask));
             }
         }
     }
@@ -170,6 +261,7 @@ pub type InstanceQueryData<'w> = (
     &'w MeshMaterial3d<StandardMaterial>,
     &'w GlobalTransform,
     &'w PreviousGlobalTransform,
+    Option<&'w ExtractedRaytracingTraits>,
 );
 
 pub type ChangedInstanceFilter = (
@@ -177,6 +269,7 @@ pub type ChangedInstanceFilter = (
     Or<(
         Changed<RaytracingMesh3d>,
         Changed<MeshMaterial3d<StandardMaterial>>,
+        Changed<ExtractedRaytracingTraits>,
     )>,
 );
 
@@ -270,7 +363,7 @@ impl InstanceState {
         inputs: &InstanceInputs,
         lights: &mut LightState,
         entity: Entity,
-        (mesh, material, transform, previous_frame_transform): InstanceQueryData,
+        (mesh, material, transform, previous_frame_transform, traits): InstanceQueryData,
     ) {
         let mesh_id = mesh.id();
         let material_id = material.id();
@@ -306,6 +399,8 @@ impl InstanceState {
             material: material_id,
             opacity: BlasOpacity::Opaque,
             buffers: previous.and_then(|instance| instance.buffers),
+            traits: traits.copied().unwrap_or_default(),
+            emitting_share: 0.0,
         };
         let resolved = self.resolve_instance(inputs, lights, entity, &mut instance);
 
@@ -404,7 +499,25 @@ impl InstanceState {
         instance.buffers = Some((vertex_buffer_key, index_buffer_key));
         self.release_buffers(previous_buffers);
 
-        let triangle_count = (index_slice.range.len() / 3) as u32;
+        let mesh_triangle_count = (index_slice.range.len() / 3) as u32;
+        let is_emissive = inputs
+            .assets
+            .emissive_materials
+            .contains(&instance.material);
+        let emitting_triangle_count = match instance.traits.emission {
+            Some(emission) => emission.triangles.min(mesh_triangle_count),
+            None => mesh_triangle_count,
+        };
+        if is_emissive && emitting_triangle_count > MAX_EMISSIVE_MESH_TRIANGLES {
+            once!(warn!(
+                "RaytracingMesh3d entity {entity} has an emissive material on a mesh of \
+                 {emitting_triangle_count} emitting triangles, and at most \
+                 {MAX_EMISSIVE_MESH_TRIANGLES} can be sampled as a light. The rest of meshes like \
+                 it only light what rays find by chance."
+            ));
+        }
+        let triangle_count = emitting_triangle_count.min(MAX_EMISSIVE_MESH_TRIANGLES);
+        instance.emitting_share = triangle_count as f32 / mesh_triangle_count.max(1) as f32;
         self.geometry_ids.grow_and_set(
             slot,
             GpuInstanceGeometryIds {
@@ -413,16 +526,19 @@ impl InstanceState {
                 index_buffer_id,
                 index_buffer_offset: index_slice.range.start,
                 triangle_count,
+                // Written once the lights have been weighed against each other
+                light_probability: 0.0,
             },
         );
         self.material_ids.grow_and_set(slot, material_slot);
-        self.set_blas_ref(slot, GpuBlasRef(blas_address));
+        let mask = if instance.traits.shadowless {
+            INSTANCE_MASK_SHADOWLESS
+        } else {
+            INSTANCE_MASK_ALL
+        };
+        self.set_blas_ref(slot, GpuBlasRef::new(blas_address, mask));
 
-        let is_emissive = inputs
-            .assets
-            .emissive_materials
-            .contains(&instance.material);
-        if is_emissive {
+        if is_emissive && triangle_count > 0 {
             lights.add_light(
                 LightSourceId::EmissiveMesh(entity),
                 GpuLightSource::new_emissive_mesh_light(slot, triangle_count),
@@ -458,9 +574,9 @@ impl InstanceState {
         }
         self.blas_refs.set(slot, reference);
 
-        if previous == GpuBlasRef::NONE {
+        if previous.is_none() && !reference.is_none() {
             self.live_count += 1;
-        } else if reference == GpuBlasRef::NONE {
+        } else if !previous.is_none() && reference.is_none() {
             self.live_count -= 1;
         }
     }

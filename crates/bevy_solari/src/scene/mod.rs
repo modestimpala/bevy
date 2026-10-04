@@ -9,7 +9,7 @@ use bevy_shader::load_shader_library;
 pub use binder::prepare_raytracing_scene_resources;
 pub use binder::{RaytracingSceneBindings, RaytracingSceneNeedsPreviousFrameData};
 pub use skinning::RaytracingSkins;
-pub use types::RaytracingMesh3d;
+pub use types::{RaytracingEmission, RaytracingMesh3d};
 
 use crate::SolariPlugins;
 use bevy_app::{App, Plugin};
@@ -32,7 +32,8 @@ use blas::{compact_raytracing_blas, delete_raytracing_blas, prepare_raytracing_b
 use extract::{
     extract_raytracing_environment_map_light, extract_raytracing_material_assets,
     extract_raytracing_scene_meshes_and_materials, extract_raytracing_scene_structural,
-    extract_raytracing_scene_transforms, ExtractedEnvironmentMapLight, StandardMaterialAssets,
+    extract_raytracing_scene_transforms, extract_raytracing_traits, ExtractedEnvironmentMapLight,
+    StandardMaterialAssets,
 };
 use skinning::{extract_raytracing_skins, prepare_raytracing_skins};
 use tracing::warn;
@@ -81,6 +82,7 @@ impl Plugin for RaytracingScenePlugin {
                     extract_raytracing_scene_transforms,
                     extract_raytracing_scene_meshes_and_materials,
                     extract_raytracing_material_assets,
+                    extract_raytracing_traits,
                     extract_raytracing_environment_map_light,
                     extract_raytracing_skins,
                 ),

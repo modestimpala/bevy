@@ -4,7 +4,8 @@ use bevy_ecs::{
     resource::Resource,
     system::{Res, ResMut},
 };
-use bevy_mesh::{Indices, Mesh, MeshRaytracingFlags};
+use bevy_math::Vec3;
+use bevy_mesh::{Indices, Mesh, MeshRaytracingFlags, VertexAttributeValues};
 use bevy_platform::collections::HashMap;
 use bevy_render::{
     diagnostic::{DiagnosticsRecorder, RecordDiagnostics},
@@ -54,8 +55,15 @@ impl BlasManager {
             .is_some_and(|mesh| !mesh.requires.contains(key.opacity.flag()))
     }
 
-    fn require(&mut self, mesh: AssetId<Mesh>, flags: MeshRaytracingFlags) {
-        self.blas.entry(mesh).or_default().requires = flags;
+    fn require(&mut self, mesh: AssetId<Mesh>, flags: MeshRaytracingFlags, surface: MeshSurface) {
+        let blas = self.blas.entry(mesh).or_default();
+        blas.requires = flags;
+        blas.surface = surface;
+    }
+
+    /// The area and centre of a mesh's surface, which say how much light it gives when it glows.
+    pub fn surface(&self, mesh: &AssetId<Mesh>) -> Option<MeshSurface> {
+        self.blas.get(mesh).map(|blas| blas.surface)
     }
 
     pub fn changed_meshes(&self) -> &[AssetId<Mesh>] {
@@ -101,8 +109,48 @@ impl BlasManager {
     }
 }
 
+/// The area of a mesh's triangles and their area-weighted centre, in the mesh's own space.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct MeshSurface {
+    pub area: f32,
+    pub centre: Vec3,
+}
+
+impl MeshSurface {
+    fn of(mesh: &Mesh) -> Self {
+        let (Some(VertexAttributeValues::Float32x3(positions)), Some(indices)) =
+            (mesh.attribute(Mesh::ATTRIBUTE_POSITION), mesh.indices())
+        else {
+            return Self::default();
+        };
+        let corner = |index: usize| positions.get(index).copied().map(Vec3::from);
+
+        let mut doubled_area = 0.0;
+        let mut weighted_centre = Vec3::ZERO;
+        let mut indices = indices.iter();
+        while let (Some(a), Some(b), Some(c)) = (indices.next(), indices.next(), indices.next()) {
+            let (Some(a), Some(b), Some(c)) = (corner(a), corner(b), corner(c)) else {
+                continue;
+            };
+            let doubled = (b - a).cross(c - a).length();
+            doubled_area += doubled;
+            weighted_centre += (a + b + c) * (doubled / 3.0);
+        }
+
+        if doubled_area > 0.0 && doubled_area.is_finite() {
+            Self {
+                area: doubled_area / 2.0,
+                centre: weighted_centre / doubled_area,
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
 struct MeshBlas {
     requires: MeshRaytracingFlags,
+    surface: MeshSurface,
     opaque: Option<Blas>,
     non_opaque: Option<Blas>,
 }
@@ -111,6 +159,7 @@ impl Default for MeshBlas {
     fn default() -> Self {
         Self {
             requires: MeshRaytracingFlags::empty(),
+            surface: MeshSurface::default(),
             opaque: None,
             non_opaque: None,
         }
@@ -197,7 +246,7 @@ pub fn prepare_raytracing_blas(
     // Record which BLAS added or changed meshes declare, even if none
     for (asset_id, mesh) in &extracted_meshes.extracted {
         if is_mesh_raytracing_compatible(mesh) {
-            blas_manager.require(*asset_id, mesh.raytracing);
+            blas_manager.require(*asset_id, mesh.raytracing, MeshSurface::of(mesh));
         }
     }
 

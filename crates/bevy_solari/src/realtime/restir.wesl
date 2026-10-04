@@ -324,8 +324,8 @@ fn reservoir_contribution(reservoir: Reservoir, resolved: ResolvedLightSample, w
         // nee_mis_weight in generate_nee_candidate and generate_emissive_candidate, which puts the same factor in the target.
         var nee_mis_weight = 1.0;
         if light_contribution.brdf_rays_can_hit && light_contribution.inverse_solid_angle_pdf > 0.0 {
-            let light_count = arrayLength(&light_sources);
-            let inverse_solid_angle_pdf = light_contribution.inverse_solid_angle_pdf * f32(light_count);
+            let light_probability = light_sources[reservoir.light_sample.light_id >> 16u].probability;
+            let inverse_solid_angle_pdf = light_contribution.inverse_solid_angle_pdf / light_probability;
             let p_nee = nee_probability(material);
             let p_nee_strategy = f32(constants.primary_di_samples) * (1.0 / inverse_solid_angle_pdf) * p_nee;
             let p_brdf_at_nee = brdf_pdf(wo, light_contribution.wi, world_normal, material, F_ab);

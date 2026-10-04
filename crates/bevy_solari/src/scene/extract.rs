@@ -1,15 +1,18 @@
-use super::{RaytracingMesh3d, RaytracingSceneBindings};
+use super::{
+    types::ExtractedRaytracingTraits, RaytracingEmission, RaytracingMesh3d, RaytracingSceneBindings,
+};
 use bevy_asset::{AssetEvent, AssetId, Assets, Handle};
 use bevy_camera::Camera;
 use bevy_ecs::{
+    entity::Entity,
     lifecycle::RemovedComponents,
     message::MessageReader,
-    query::{Added, Changed, Or, With},
+    query::{Added, Changed, Has, Or, With},
     resource::Resource,
     system::{Commands, Query, Res, ResMut},
 };
 use bevy_image::Image;
-use bevy_light::EnvironmentMapLight;
+use bevy_light::{EnvironmentMapLight, NotShadowCaster};
 use bevy_math::Quat;
 use bevy_pbr::{MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
 use bevy_platform::collections::HashMap;
@@ -105,6 +108,52 @@ pub fn extract_raytracing_scene_meshes_and_materials(
         if let Ok((mut mesh, mut material)) = render_instances.get_mut(render_entity) {
             *mesh = new_mesh.clone();
             *material = new_material.clone();
+        }
+    }
+}
+
+/// Carries each raytracing instance's [`RaytracingEmission`] and whether it has
+/// [`NotShadowCaster`] into the render world, as they come, change and go.
+pub fn extract_raytracing_traits(
+    changed: Extract<
+        Query<
+            Entity,
+            (
+                With<RaytracingMesh3d>,
+                Or<(
+                    Changed<RaytracingEmission>,
+                    Added<RaytracingMesh3d>,
+                    Added<NotShadowCaster>,
+                )>,
+            ),
+        >,
+    >,
+    mut lost_emission: Extract<RemovedComponents<RaytracingEmission>>,
+    mut lost_shadowless: Extract<RemovedComponents<NotShadowCaster>>,
+    instances: Extract<
+        Query<
+            (
+                RenderEntity,
+                Option<&RaytracingEmission>,
+                Has<NotShadowCaster>,
+            ),
+            With<RaytracingMesh3d>,
+        >,
+    >,
+    mut commands: Commands,
+) {
+    for main_entity in lost_emission
+        .read()
+        .chain(lost_shadowless.read())
+        .chain(changed.iter())
+    {
+        if let Ok((render_entity, emission, shadowless)) = instances.get(main_entity) {
+            commands
+                .entity(render_entity)
+                .insert(ExtractedRaytracingTraits {
+                    emission: emission.copied(),
+                    shadowless,
+                });
         }
     }
 }

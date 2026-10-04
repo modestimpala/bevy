@@ -502,13 +502,13 @@ fn build_tlas_through_wgpu_core(
         let capacity = tlas.get().len();
         tlas[0..capacity].iter_mut().for_each(|entry| *entry = None);
 
-        for (slot, entity, mesh, transform) in bindings.instances.drawable() {
+        for (slot, entity, blas_key, transform) in bindings.instances.drawable() {
             // A mesh can lose its acceleration structure after the instance resolved against it,
             // which leaves the slot with nothing to point at for a frame
             let blas = if skins.contains(entity) {
                 skins.blas(entity)
             } else {
-                blas_manager.get(&mesh)
+                blas_manager.get(&blas_key)
             };
             let Some(blas) = blas else {
                 continue;

@@ -36,7 +36,7 @@ use bevy_render::{
         RenderDevice, RenderQueue,
     },
     texture::CachedTexture,
-    view::prepare_view_targets,
+    view::{prepare_view_targets, window::prepare_windows},
     ExtractSchedule, Render, RenderApp, RenderSystems,
 };
 use dlss_wgpu::{
@@ -186,6 +186,9 @@ impl Plugin for DlssPlugin {
                     prepare::prepare_dlss::<DlssRayReconstructionFeature>,
                 )
                     .in_set(RenderSystems::PrepareViews)
+                    // Creating a DLSS context submits work to the queue, and wgpu refuses to
+                    // configure a surface while another thread submits
+                    .after(prepare_windows)
                     .before(prepare_view_targets),
             );
 

@@ -166,7 +166,6 @@ struct SkinnedInstance {
     vertex_count: u32,
     index_count: u32,
     output: Buffer,
-    params: Buffer,
     blas: [Blas; BLAS_RING],
     blas_size: BlasTriangleGeometrySizeDescriptor,
     /// The structure last built, if any has been.
@@ -174,6 +173,13 @@ struct SkinnedInstance {
     /// The joints and transform it was last skinned with.
     joints: Vec<Mat4>,
     world_from_local: Affine3A,
+    /// The bind groups it was last skinned with, each by the vertex, joint and parameter
+    /// buffers it binds: the joints' buffer is one of two, turn about, and a bind group
+    /// made anew for every skin that moved in every frame was most of what the skinning
+    /// asked of the device.
+    bind_groups: [Option<([BufferId; 3], BindGroup)>; 2],
+    /// Which of those is replaced next.
+    stalest: usize,
 }
 
 /// Every skinned instance in the raytracing scene, and the pass that skins them.
@@ -184,6 +190,12 @@ pub struct RaytracingSkins {
     instances: EntityHashMap<SkinnedInstance>,
     /// Instances whose acceleration structure changed this frame.
     moved: Vec<Entity>,
+    /// The parameters of every instance skinned in a frame, one after another, each read
+    /// at its own offset: written once a frame. A buffer to each instance was a write to
+    /// each, and every write a staging buffer made for it.
+    params: Option<Buffer>,
+    /// What is written to it, kept from frame to frame.
+    staged: Vec<u8>,
 }
 
 impl FromWorld for RaytracingSkins {
@@ -193,7 +205,7 @@ impl FromWorld for RaytracingSkins {
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::COMPUTE,
                 (
-                    uniform_buffer_sized(false, NonZeroU64::new(size_of::<GpuSkinParams>() as u64)),
+                    uniform_buffer_sized(true, NonZeroU64::new(size_of::<GpuSkinParams>() as u64)),
                     storage_buffer_read_only_sized(false, None),
                     storage_buffer_read_only_sized(false, None),
                     storage_buffer_sized(false, None),
@@ -216,6 +228,8 @@ impl FromWorld for RaytracingSkins {
             pipeline,
             instances: EntityHashMap::default(),
             moved: Vec::new(),
+            params: None,
+            staged: Vec::new(),
         }
     }
 }
@@ -261,12 +275,6 @@ fn create_instance(
         usage: BufferUsages::STORAGE | BufferUsages::BLAS_INPUT,
         mapped_at_creation: false,
     });
-    let params = render_device.create_buffer(&BufferDescriptor {
-        label: Some("solari_skinning_params"),
-        size: size_of::<GpuSkinParams>() as u64,
-        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
     let blas_size = BlasTriangleGeometrySizeDescriptor {
         vertex_format: Mesh::ATTRIBUTE_POSITION.format,
         vertex_count,
@@ -294,12 +302,13 @@ fn create_instance(
         vertex_count,
         index_count,
         output,
-        params,
         blas,
         blas_size,
         current: None,
         joints: Vec::new(),
         world_from_local: Affine3A::IDENTITY,
+        bind_groups: [None, None],
+        stalest: 0,
     }
 }
 
@@ -333,7 +342,8 @@ pub fn prepare_raytracing_skins(
     let layout = pipeline_cache.get_bind_group_layout(&skins.layout);
 
     let mut seen = EntityHashSet::default();
-    // (entity, bind group, workgroups, index slab and its first index)
+    // (entity, pipeline, parameters, vertex slab, workgroups, index slab and its first
+    // index, the structure to build)
     let mut work = Vec::new();
 
     for (entity, main_entity, mesh, skin) in &instances {
@@ -421,24 +431,14 @@ pub fn prepare_raytracing_skins(
             joint_weight_word: source.joint_weight,
             _pad: [0; 2],
         };
-        render_queue.write_buffer(&instance.params, 0, bytemuck::bytes_of(&params));
-        let bind_group = render_device.create_bind_group(
-            "solari_skinning_bind_group",
-            &layout,
-            &BindGroupEntries::sequential((
-                instance.params.as_entire_binding(),
-                vertex_slice.buffer.as_entire_binding(),
-                skin_uniforms.current_buffer.as_entire_binding(),
-                instance.output.as_entire_binding(),
-            )),
-        );
         let next = instance
             .current
             .map_or(0, |current| (current + 1) % BLAS_RING);
         work.push((
             entity,
             pipeline,
-            bind_group,
+            params,
+            vertex_slice.buffer.clone(),
             vertex_count.div_ceil(64),
             index_slice.buffer.clone(),
             index_slice.range.start,
@@ -466,19 +466,82 @@ pub fn prepare_raytracing_skins(
         return;
     }
 
+    // Every instance's parameters in the one buffer, each at an offset of its own, and
+    // written once.
+    let size = size_of::<GpuSkinParams>();
+    let stride =
+        size.next_multiple_of(render_device.limits().min_uniform_buffer_offset_alignment as usize);
+    skins.staged.clear();
+    skins.staged.resize(work.len() * stride, 0);
+    for (i, (_, _, params, ..)) in work.iter().enumerate() {
+        skins.staged[i * stride..i * stride + size].copy_from_slice(bytemuck::bytes_of(params));
+    }
+    let needed = skins.staged.len() as u64;
+    if skins
+        .params
+        .as_ref()
+        .is_none_or(|held| held.size() < needed)
+    {
+        skins.params = Some(render_device.create_buffer(&BufferDescriptor {
+            label: Some("solari_skinning_params"),
+            size: needed.next_power_of_two(),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+    }
+    let params = skins.params.clone().unwrap();
+    render_queue.write_buffer(&params, 0, &skins.staged);
+    let joints = &skin_uniforms.current_buffer;
+    // (bind group, where its parameters are, workgroups)
+    let dispatches: Vec<(BindGroup, u32, u32)> = work
+        .iter()
+        .enumerate()
+        .map(|(i, (entity, _, _, vertices, workgroups, ..))| {
+            let instance = skins.instances.get_mut(entity).unwrap();
+            let bound = [vertices.id(), joints.id(), params.id()];
+            let kept = instance
+                .bind_groups
+                .iter()
+                .flatten()
+                .find(|(buffers, _)| *buffers == bound)
+                .map(|(_, bind_group)| bind_group.clone());
+            let bind_group = kept.unwrap_or_else(|| {
+                let bind_group = render_device.create_bind_group(
+                    "solari_skinning_bind_group",
+                    &layout,
+                    &BindGroupEntries::sequential((
+                        BufferBinding {
+                            buffer: &params,
+                            offset: 0,
+                            size: NonZeroU64::new(size as u64),
+                        },
+                        vertices.as_entire_binding(),
+                        joints.as_entire_binding(),
+                        instance.output.as_entire_binding(),
+                    )),
+                );
+                instance.bind_groups[instance.stalest] = Some((bound, bind_group.clone()));
+                instance.stalest = (instance.stalest + 1) % instance.bind_groups.len();
+                bind_group
+            });
+            (bind_group, (i * stride) as u32, *workgroups)
+        })
+        .collect();
+    let pipeline = work[0].1;
+
     let mut command_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("solari_skinning_command_encoder"),
     });
     if let Some(diagnostics) = diagnostics.as_mut() {
         let time_span = diagnostics.time_span(&mut command_encoder, "solari_skinning");
-        skin(&mut command_encoder, &work);
+        skin(&mut command_encoder, pipeline, &dispatches);
         time_span.end(&mut command_encoder);
     } else {
-        skin(&mut command_encoder, &work);
+        skin(&mut command_encoder, pipeline, &dispatches);
     }
     let geometries: Vec<_> = work
         .iter()
-        .map(|(entity, _, _, _, index_buffer, first_index, next)| {
+        .map(|(entity, _, _, _, _, index_buffer, first_index, next)| {
             let instance = &skins.instances[entity];
             (
                 &instance.blas[*next],
@@ -528,15 +591,16 @@ pub fn prepare_raytracing_skins(
 /// Records the skinning dispatches of this frame's moved instances.
 fn skin(
     command_encoder: &mut CommandEncoder,
-    work: &[(Entity, &ComputePipeline, BindGroup, u32, Buffer, u32, usize)],
+    pipeline: &ComputePipeline,
+    dispatches: &[(BindGroup, u32, u32)],
 ) {
     let mut pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
         label: Some("solari_skinning"),
         timestamp_writes: None,
     });
-    for (_, pipeline, bind_group, workgroups, ..) in work {
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
+    pass.set_pipeline(pipeline);
+    for (bind_group, params, workgroups) in dispatches {
+        pass.set_bind_group(0, bind_group, &[*params]);
         pass.dispatch_workgroups(*workgroups, 1, 1);
     }
 }
